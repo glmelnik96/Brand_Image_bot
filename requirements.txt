@@ -1,0 +1,23 @@
+# Core
+httpx[http2]==0.27.2
+pydantic==2.9.2
+pydantic-settings==2.5.2
+python-dotenv==1.0.1
+loguru==0.7.2
+
+# Browser automation (recon + auth bootstrap)
+playwright==1.47.0
+
+# Telegram bot
+python-telegram-bot[ext]==21.6
+
+# Storage
+redis==5.0.8
+
+# Optional: anti-fingerprint HTTP client (раскомментируй, если столкнёмся с TLS-fp)
+# curl-cffi==0.7.3
+
+# Dev
+pytest==8.3.3
+pytest-asyncio==0.24.0
+rich==13.8.1
