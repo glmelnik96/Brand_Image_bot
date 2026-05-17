@@ -4,8 +4,8 @@
 Если ./user_data/ всё ещё авторизован, SPA сама дёрнет refresh при загрузке —
 мы дожидаемся networkidle и снимаем storage в новый recon-дамп.
 
-Запуск:
-    .venv/bin/python -m recon.refresh_capture
+Запуск (после активации venv):
+    python -m recon.refresh_capture
 """
 from __future__ import annotations
 

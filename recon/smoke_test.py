@@ -5,8 +5,8 @@ Smoke-test: end-to-end генерация через клиент.
   - Если есть storage/session.json — используем её (продлевается через refresh).
   - Иначе — bootstrap из последнего recon/captures/storage-*.json и сохраняем.
 
-Запуск:
-    .venv/bin/python -m recon.smoke_test "your prompt here"
+Запуск (после активации venv):
+    python -m recon.smoke_test "your prompt here"
 """
 
 from __future__ import annotations

@@ -62,7 +62,8 @@ from bot.auth import whitelist_only
 from bot.state import USER_QUEUE_LIMIT, TaskRecipe, get_state
 from client.api import _SSL_CTX, PhygitalClient
 from client.models import GenerationJob
-from workflows.gpt_image import GPTImageWorkflow
+from workflows.brand_img2img import run_brand_img2img
+from workflows.brand_text2img import run_brand_text2img
 from workflows.image_gen import ImageGenWorkflow
 from workflows.image_to_image import ImageToImageWorkflow
 from workflows.speaker_prep import (
@@ -72,25 +73,30 @@ from workflows.speaker_prep import (
 )
 
 # ── state IDs ──────────────────────────────────────────────────────────────
-# /generate
-GEN_PROMPT, GEN_NODE, GEN_MODEL, GEN_RATIO, GEN_RES = range(1, 6)
-# /generate (GPT Image branch)
-GEN_GPT_QUALITY, GEN_GPT_ASPECT, GEN_GPT_BG = range(6, 9)
-# /img2img
-I2I_COLLECT, I2I_PROMPT, I2I_NODE, I2I_MODEL, I2I_RATIO, I2I_RES = range(10, 16)
-# /img2img (GPT Image branch)
-I2I_GPT_QUALITY, I2I_GPT_ASPECT, I2I_GPT_BG = range(16, 19)
+# /generate: prompt → ratio → resolution (модель и нода зашиты: Nano Banana v3.1).
+GEN_PROMPT, GEN_RATIO, GEN_RES = range(1, 4)
+# /img2img: collect → prompt → ratio → resolution.
+I2I_COLLECT, I2I_PROMPT, I2I_RATIO, I2I_RES = range(10, 14)
 # /prep_speaker
 SP_PHOTO, SP_GENDER, SP_RATIO, SP_RES = range(20, 24)
+# /brand_generate: prompt → ratio → resolution.
+# UX как /generate, между текстом и Nano Banana вставлен Gemini Text (CloudRu Enhancer).
+BT2I_PROMPT, BT2I_RATIO, BT2I_RES = range(30, 33)
+# /brand_img2img: collect (1-4) → /done → ratio → resolution. Пользователь НЕ пишет промпт —
+# Gemini Text запускается с фикс. text_prompt="Read the System Prompt" + system-prompt-документом.
+BI2I_COLLECT, BI2I_RATIO, BI2I_RES = range(40, 43)
 
 TG_PHOTO_LIMIT_BYTES = 10 * 1024 * 1024
 
-# Ориентиры по времени генерации.
+# Ориентир по времени генерации.
 # Nano Banana — медиана ~37s из реальных логов (6 задач 13 мая: 27–87s).
-# GPT Image — пока берём от Phygital `averageTimeInSeconds=500`, перекалибруем
-# когда накопим тайминги.
 ETA_NANO_BANANA_SEC = 45
-ETA_GPT_IMAGE_SEC = 500
+# Brand-сценарии = два последовательных task'а (Gemini Text ~25–40s + Nano Banana ~30–60s).
+ETA_BRAND_SEC = 90
+
+# Фиксированный вариант модели Nano Banana — Phygital поддерживает v2/v2.5/v3/v3.1,
+# боту оставили только v3.1 (Pro), чтобы убрать лишний шаг пикера.
+NANO_BANANA_MODEL = "v3_1"
 
 
 def _fmt_eta(seconds: int) -> str:
@@ -102,55 +108,36 @@ def _fmt_eta(seconds: int) -> str:
         return f"~{m:.1f} мин"
     return f"~{int(m)} мин"
 
-# ── параметры нод (взяты из GET /api/v2/nodes/ recon) ──────────────────────
-# Gemini Image API (Nano Banana), workflow id=94
-GEMINI_MODELS: list[tuple[str, str]] = [
-    ("v3", "v3"),
-    ("v3_1", "v3.1 (Pro)"),
-]
+
+def _escape_prompt(prompt: str) -> str:
+    """Чистит prompt для записи в логи: переводы строк → \\n, чтобы каждая запись была одной строкой.
+    Используется в `prompt=...` маркерах, которые потом парсит `tools/digest.py`."""
+    return prompt.replace("\r\n", "\\n").replace("\n", "\\n")
+
+# ── параметры нод (взяты из GET /api/v2/nodes/, проверено 2026-05-17) ──────
+# Gemini Image API (Nano Banana), workflow id=94. 15 ratios — полный enum Phygital+.
 GEMINI_RATIOS: list[tuple[str, str]] = [
     ("default", "auto"),
     ("r_1_1", "1:1"),
     ("r_3_4", "3:4"),
     ("r_4_3", "4:3"),
-    ("r_9_16", "9:16"),
-    ("r_16_9", "16:9"),
     ("r_2_3", "2:3"),
     ("r_3_2", "3:2"),
+    ("r_4_5", "4:5"),
+    ("r_5_4", "5:4"),
+    ("r_9_16", "9:16"),
+    ("r_16_9", "16:9"),
+    ("r_21_9", "21:9"),
+    ("r_1_4", "1:4"),
+    ("r_4_1", "4:1"),
+    ("r_1_8", "1:8"),
+    ("r_8_1", "8:1"),
 ]
 GEMINI_RESOLUTIONS: list[tuple[str, str]] = [
     ("default", "auto"),
     ("k1", "1K"),
     ("k2", "2K"),
     ("k4", "4K"),
-]
-
-NODES: list[tuple[str, str]] = [
-    ("nb", "🍌 Nano Banana"),
-    ("gpt", "🤖 GPT Image 2"),
-]
-
-# GPT Image API, workflow id=98 (значения enum из /api/v2/nodes/ recon)
-GPT_QUALITIES: list[tuple[str, str]] = [
-    ("High", "High"),
-    ("Medium", "Medium"),
-    ("Low", "Low"),
-]
-GPT_ASPECTS: list[tuple[str, str]] = [
-    ("auto", "auto"),
-    ("r_1024_1024", "1024²"),
-    ("r_1536_1024", "1536×1024"),
-    ("r_1024_1536", "1024×1536"),
-    ("r_2048_2048", "2048²"),
-    ("r_2048_1152", "2048×1152"),
-    ("r_1152_2048", "1152×2048"),
-    ("r_3840_2160", "3840×2160"),
-    ("r_2160_3840", "2160×3840"),
-]
-GPT_BACKGROUNDS: list[tuple[str, str]] = [
-    ("auto", "auto"),
-    ("transparent", "transparent"),
-    ("opaque", "opaque"),
 ]
 
 
@@ -172,24 +159,37 @@ def _kb(
     if cur:
         rows.append(cur)
     if with_cancel:
-        rows.append([InlineKeyboardButton("✖️ Отмена", callback_data="cancel:picker")])
+        rows.append([InlineKeyboardButton("Отмена", callback_data="cancel:picker")])
     return InlineKeyboardMarkup(rows)
 
 
-def _action_keyboard(task_uid: str) -> InlineKeyboardMarkup:
-    """Клавиатура под готовый результат — три кнопки повторного использования."""
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄 Повторить", callback_data=f"regen:{task_uid}"),
-        InlineKeyboardButton("✏️ Уточнить", callback_data=f"editp:{task_uid}"),
-        InlineKeyboardButton("🖼 Как img2img", callback_data=f"asi2i:{task_uid}"),
-    ]])
+def _action_keyboard(task_uid: str, *, workflow: str = "nb_t2i") -> InlineKeyboardMarkup:
+    """Клавиатура под готовый результат — кнопки повторного использования.
+
+    Раскладка:
+      [Повторить] [Изменить текст]                     ← вторая кнопка скрыта для brand_i2i
+      [В img2img] [В brand img2img]                    ← два варианта продолжения как img2img
+
+    workflow="brand_i2i" — пользовательского текста нет (промпт фикс. в коде),
+    поэтому кнопку «Изменить текст» скрываем; первая строка остаётся с одной кнопкой.
+    """
+    top_row = [InlineKeyboardButton("Повторить", callback_data=f"regen:{task_uid}")]
+    if workflow != "brand_i2i":
+        top_row.append(InlineKeyboardButton("Изменить текст", callback_data=f"editp:{task_uid}"))
+    bottom_row = [
+        InlineKeyboardButton("В img2img", callback_data=f"asi2i:{task_uid}"),
+        InlineKeyboardButton("В brand img2img", callback_data=f"asbi2i:{task_uid}"),
+    ]
+    return InlineKeyboardMarkup([top_row, bottom_row])
 
 
 MENU_KEYBOARD = InlineKeyboardMarkup([
-    [InlineKeyboardButton("🎨 Сгенерировать (text→image)", callback_data="menu:generate")],
-    [InlineKeyboardButton("🖼 Image→Image", callback_data="menu:img2img")],
-    [InlineKeyboardButton("👤 Подготовить спикера", callback_data="menu:prep_speaker")],
-    [InlineKeyboardButton("ℹ️ Помощь", callback_data="menu:help")],
+    [InlineKeyboardButton("Брендовая картинка по тексту", callback_data="menu:brand_generate")],
+    [InlineKeyboardButton("Брендовая обработка картинки", callback_data="menu:brand_img2img")],
+    [InlineKeyboardButton("Создать картинку по тексту", callback_data="menu:generate")],
+    [InlineKeyboardButton("Изменить картинки по тексту", callback_data="menu:img2img")],
+    [InlineKeyboardButton("Обработать фото спикера", callback_data="menu:prep_speaker")],
+    [InlineKeyboardButton("Помощь", callback_data="menu:help")],
 ])
 
 
@@ -232,8 +232,9 @@ async def _check_user_capacity(update: Update) -> bool:
     inflight, queued = state.user_load(uid)
     if inflight + queued >= USER_QUEUE_LIMIT:
         msg = (
-            f"⏳ Очередь заполнена ({USER_QUEUE_LIMIT} задач, "
-            f"в работе {inflight} / ожидают {queued}). Дождись пока что-то закончится."
+            f"Очередь заполнена: {USER_QUEUE_LIMIT} задач "
+            f"(в работе {inflight}, ожидают {queued}). "
+            "Дождись, пока что-то закончится."
         )
         target = _first_message(update)
         await target.reply_text(msg)
@@ -269,14 +270,14 @@ async def _enqueue_task(
     if total_after > USER_QUEUE_LIMIT:
         log.warning(f"rejected: user queue full ({inflight} inflight + {queued} queued)")
         await chat.send_message(
-            f"⏳ Очередь заполнена ({USER_QUEUE_LIMIT} задач). "
-            f"Дождись пока что-то закончится."
+            f"Очередь заполнена ({USER_QUEUE_LIMIT} задач). "
+            "Дождись, пока что-то закончится."
         )
         return
 
     queue_pos = inflight + queued + 1  # 1-based «эта задача — N-я твоя в полёте»
     status: Message = await chat.send_message(
-        f"📥 {label}: принято (твоя задача #{queue_pos}){eta_hint}"
+        f"Принято: {label}. Это твоя задача №{queue_pos}{eta_hint}."
     )
     queued_at = time.monotonic()
     task_uid = uuid.uuid4().hex[:8]
@@ -295,7 +296,7 @@ async def _enqueue_task(
         # Между user_load и submit_task проскочила другая задача — отбиваемся.
         log.warning("rejected at submit: queue full race")
         await status.edit_text(
-            f"❌ Очередь заполнилась прямо сейчас, попробуй ещё раз."
+            "Очередь заполнилась прямо сейчас. Попробуй ещё раз."
         )
         return
     log.info(f"enqueued (queue_pos={queue_pos}, inflight={inflight}, queued={queued})")
@@ -323,7 +324,7 @@ async def _execute_task(
     eta_hint = f" (обычно {_fmt_eta(eta_sec)})" if eta_sec else ""
 
     try:
-        await status.edit_text(f"📥 {label}: в очереди…{eta_hint}")
+        await status.edit_text(f"В очереди: {label}{eta_hint}.")
     except Exception:
         pass
 
@@ -332,11 +333,20 @@ async def _execute_task(
             queue_wait = time.monotonic() - queued_at
             log.info(f"started (queue_wait={queue_wait:.1f}s)")
             try:
-                await status.edit_text(f"🎨 {label}: генерирую…{eta_hint}")
+                await status.edit_text(f"Генерирую: {label}{eta_hint}…")
             except Exception:
                 pass
             run_started = time.monotonic()
-            job = await runner()
+
+            async def progress(msg: str) -> None:
+                """Промежуточный статус (например, между Gemini Text и Nano Banana
+                в brand-цепочках). Не валим задачу, если edit_text не прошёл."""
+                try:
+                    await status.edit_text(f"{label}{eta_hint}: {msg}")
+                except Exception as e:
+                    log.debug(f"progress edit_text failed (non-fatal): {e!r}")
+
+            job = await runner(progress_cb=progress)
             gen_dur = time.monotonic() - run_started
 
         log = log.bind(job_id=job.job_id)
@@ -346,16 +356,18 @@ async def _execute_task(
 
         if job.status == "completed" and job.result_urls:
             await status.edit_text(
-                f"✅ {label}: готово за {gen_dur:.0f}с (job_id={job.job_id})"
+                f"Готово за {gen_dur:.0f} сек: {label} (job_id={job.job_id})."
             )
             # Скачиваем + отправляем каждую картинку; ловим путь к первой для regen-cache.
             first_result_local: Path | None = None
+            workflow_for_kb = recipe_template.workflow if recipe_template else "nb_t2i"
             for i, url in enumerate(job.result_urls, 1):
                 local = await _send_result_image(
                     chat=chat, log=log, url=url, uid=uid, task_uid=task_uid,
                     idx=i, total=len(job.result_urls),
                     with_action_kb=(i == 1 and recipe_template is not None),
                     action_task_uid=task_uid,
+                    action_workflow=workflow_for_kb,
                 )
                 if i == 1 and local is not None:
                     first_result_local = local
@@ -372,15 +384,17 @@ async def _execute_task(
         elif job.status == "completed":
             log.error("completed but result_urls is empty")
             await status.edit_text(
-                f"❌ {label}: задача завершилась, но Phygital не вернул ссылки на файлы"
+                f"Ошибка ({label}): задача завершилась, но Phygital не вернул ссылки на файлы."
             )
         else:
             log.warning(f"job not completed: {job.status} err={job.error!r}")
-            await status.edit_text(f"❌ {label}: {job.status}\n{job.error or '—'}")
+            await status.edit_text(
+                f"Ошибка ({label}): {job.status}\n{job.error or '—'}"
+            )
     except Exception as e:
         log.opt(exception=e).error(f"task crashed: {type(e).__name__}: {e}")
         try:
-            await status.edit_text(f"❌ {label}: {type(e).__name__}: {e}")
+            await status.edit_text(f"Ошибка ({label}): {type(e).__name__}: {e}")
         except Exception as e2:
             log.warning(f"could not edit status message: {e2!r}")
     finally:
@@ -435,6 +449,7 @@ def _persist_recipe(
 async def _send_result_image(
     *, chat: Chat, log, url: str, uid: int, task_uid: str, idx: int, total: int,
     with_action_kb: bool = False, action_task_uid: str | None = None,
+    action_workflow: str = "nb_t2i",
 ) -> Path | None:
     """Скачивает result-картинку и отправляет в чат. Возвращает локальный путь (для regen_cache).
 
@@ -456,7 +471,11 @@ async def _send_result_image(
       Поэтому при `with_action_kb=True` мы всегда скачиваем (см. ниже).
     """
     state = get_state()
-    kb = _action_keyboard(action_task_uid) if (with_action_kb and action_task_uid) else None
+    kb = (
+        _action_keyboard(action_task_uid, workflow=action_workflow)
+        if (with_action_kb and action_task_uid)
+        else None
+    )
 
     # Если нужны кнопки + локальный путь (для asi2i) — пропускаем url-стратегию,
     # сразу качаем и шлём upload. Иначе оптимизируем под скорость и пробуем url первым.
@@ -498,7 +517,7 @@ async def _send_result_image(
         )
         try:
             await chat.send_message(
-                f"❌ не смог отправить картинку {idx}/{total}, ссылка:\n{url}",
+                f"Не смог отправить картинку {idx}/{total}. Ссылка:\n{url}",
                 reply_markup=kb,
             )
         except Exception as e2:
@@ -522,24 +541,17 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         except Exception:
             pass
         try:
-            await update.callback_query.edit_message_text("✖️ Отменено.")
+            await update.callback_query.edit_message_text("Отменено.")
         except Exception:
             pass
     elif update.message:
-        await update.message.reply_text("Отменено (текущие задачи в Phygital продолжают идти).")
+        await update.message.reply_text(
+            "Отменено. Уже запущенные задачи в Phygital продолжают выполняться."
+        )
     return ConversationHandler.END
 
 
 # ── GPT Image: первая ступень пикера после выбора ноды ────────────────────
-async def _ask_gpt_quality(q) -> None:
-    await q.answer()
-    await _edit_picked(q, "Модель", "GPT Image 2")
-    await q.message.chat.send_message(
-        "Качество (стоимость растёт с High):",
-        reply_markup=_kb("gptq", GPT_QUALITIES, cols=3),
-    )
-
-
 # ── /generate ──────────────────────────────────────────────────────────────
 @whitelist_only
 async def gen_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -558,16 +570,17 @@ async def gen_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if args:
         prompt = " ".join(args).strip()
         ctx.user_data["prompt"] = prompt
-        log.info(f"inline args: prompt_chars={len(prompt)} — asking for node")
+        log.info(f"inline args: prompt_chars={len(prompt)} — asking for ratio")
         await target.reply_text(
-            f"Выбери ноду:\n"
-            f"• Nano Banana — {_fmt_eta(ETA_NANO_BANANA_SEC)} на картинку\n"
-            f"• GPT Image 2 — {_fmt_eta(ETA_GPT_IMAGE_SEC)} на картинку",
-            reply_markup=_kb("node", NODES, cols=2),
+            "Описание принято. Теперь выбери соотношение сторон. "
+            "Кнопка «auto» — модель подберёт сама.",
+            reply_markup=_kb("ratio", GEMINI_RATIOS, cols=4),
         )
-        return GEN_NODE
+        return GEN_RATIO
     log.info("entered prompt-collection state")
-    await target.reply_text("✍️ Пришли текст промпта (или /cancel):")
+    await target.reply_text(
+        "Опиши текстом, что нужно нарисовать. /cancel — выйти."
+    )
     return GEN_PROMPT
 
 
@@ -577,128 +590,15 @@ async def gen_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     prompt = (update.message.text or "").strip()
     if not prompt:
         log.warning("empty prompt, asking again")
-        await update.message.reply_text("Пустой prompt. Попробуй ещё раз или /cancel.")
+        await update.message.reply_text(
+            "Пустое описание. Пришли текст ещё раз или /cancel."
+        )
         return GEN_PROMPT
     ctx.user_data["prompt"] = prompt
-    log.info(f"prompt received: chars={len(prompt)}; asking for node")
+    log.info(f"prompt received: chars={len(prompt)} prompt={_escape_prompt(prompt)!r}; asking for ratio")
     await update.message.reply_text(
-        f"Выбери ноду:\n"
-        f"• Nano Banana — {_fmt_eta(ETA_NANO_BANANA_SEC)} на картинку\n"
-        f"• GPT Image 2 — {_fmt_eta(ETA_GPT_IMAGE_SEC)} на картинку",
-        reply_markup=_kb("node", NODES, cols=2),
-    )
-    return GEN_NODE
-
-
-@whitelist_only
-async def gen_node(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    node = q.data.split(":", 1)[1]
-    log = _ulog(update, "/generate")
-    ctx.user_data["node"] = node
-    log.info(f"node picked: {node}")
-    if node == "gpt":
-        await _ask_gpt_quality(q)
-        return GEN_GPT_QUALITY
-    await q.answer()
-    await _edit_picked(q, "Модель", "Nano Banana")
-    await q.message.chat.send_message(
-        "Какой вариант модели?", reply_markup=_kb("model", GEMINI_MODELS, cols=2)
-    )
-    return GEN_MODEL
-
-
-@whitelist_only
-async def gen_gpt_quality(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    quality = q.data.split(":", 1)[1]
-    ctx.user_data["gpt_quality"] = quality
-    _ulog(update, "/generate").info(f"gpt quality: {quality}")
-    await _edit_picked(q, "Качество", quality)
-    await q.message.chat.send_message(
-        "Соотношение сторон / разрешение:",
-        reply_markup=_kb("gpta", GPT_ASPECTS, cols=3),
-    )
-    return GEN_GPT_ASPECT
-
-
-@whitelist_only
-async def gen_gpt_aspect(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    aspect = q.data.split(":", 1)[1]
-    ctx.user_data["gpt_aspect"] = aspect
-    label = dict(GPT_ASPECTS).get(aspect, aspect)
-    _ulog(update, "/generate").info(f"gpt aspect: {aspect}")
-    await _edit_picked(q, "Размер", label)
-    await q.message.chat.send_message(
-        "Фон:",
-        reply_markup=_kb("gptb", GPT_BACKGROUNDS, cols=3),
-    )
-    return GEN_GPT_BG
-
-
-@whitelist_only
-async def gen_gpt_bg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    bg = q.data.split(":", 1)[1]
-    ctx.user_data["gpt_bg"] = bg
-    _ulog(update, "/generate").info(f"gpt background: {bg}; launching")
-    await _edit_picked(q, "Фон", bg)
-    await _gen_run_gpt(update, ctx)
-    return ConversationHandler.END
-
-
-async def _gen_run_gpt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    prompt: str = ctx.user_data["prompt"]
-    quality = ctx.user_data.get("gpt_quality", "Medium")
-    aspect = ctx.user_data.get("gpt_aspect", "auto")
-    bg = ctx.user_data.get("gpt_bg", "auto")
-    state = get_state()
-    u = update.effective_user
-    chat = update.effective_chat
-
-    async def runner() -> GenerationJob:
-        async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
-            wf = GPTImageWorkflow(
-                client, version="v2", aspect_ratio=aspect,
-                quality=quality, background=bg, number_of_images=1,
-            )
-            return await wf.run(prompt=prompt)
-
-    template = TaskRecipe(
-        task_uid="",  # будет проставлен в _execute_task
-        user_id=u.id,
-        label=f"generate-gpt/{quality}/{aspect}/{bg}",
-        workflow="gpt_t2i",
-        prompt=prompt,
-        params={"quality": quality, "aspect": aspect, "bg": bg},
-    )
-    await _enqueue_task(
-        ctx=ctx,
-        uid=u.id,
-        uname=u.username or u.full_name or "?",
-        chat=chat,
-        runner=runner,
-        label=f"generate-gpt/{quality}/{aspect}/{bg}",
-        eta_sec=ETA_GPT_IMAGE_SEC,
-        recipe_template=template,
-    )
-
-
-@whitelist_only
-async def gen_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    model = q.data.split(":", 1)[1]
-    ctx.user_data["model_name"] = model
-    label = dict(GEMINI_MODELS).get(model, model)
-    _ulog(update, "/generate").info(f"model_name: {model}")
-    await _edit_picked(q, "Вариант", label)
-    await q.message.chat.send_message(
-        "Соотношение сторон:", reply_markup=_kb("ratio", GEMINI_RATIOS, cols=4)
+        "Выбери соотношение сторон. Кнопка «auto» — модель подберёт сама.",
+        reply_markup=_kb("ratio", GEMINI_RATIOS, cols=4),
     )
     return GEN_RATIO
 
@@ -713,7 +613,8 @@ async def gen_ratio(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     _ulog(update, "/generate").info(f"ratio: {ratio}")
     await _edit_picked(q, "Соотношение", label)
     await q.message.chat.send_message(
-        "Разрешение:", reply_markup=_kb("res", GEMINI_RESOLUTIONS, cols=4)
+        "Выбери разрешение. Кнопка «auto» — модель подберёт сама.",
+        reply_markup=_kb("res", GEMINI_RESOLUTIONS, cols=4),
     )
     return GEN_RES
 
@@ -733,14 +634,14 @@ async def gen_res(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def _gen_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     prompt: str = ctx.user_data["prompt"]
-    model = ctx.user_data.get("model_name", "v3")
+    model = NANO_BANANA_MODEL
     ratio = ctx.user_data.get("ratio", "default")
     resolution = ctx.user_data.get("resolution", "default")
     state = get_state()
     u = update.effective_user
     chat = update.effective_chat
 
-    async def runner() -> GenerationJob:
+    async def runner(progress_cb=None) -> GenerationJob:
         async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
             wf = ImageGenWorkflow(
                 client, model_name=model, ratio=ratio, resolution=resolution
@@ -779,8 +680,8 @@ async def i2i_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data["init_paths"] = []
     target = _first_message(update)
     await target.reply_text(
-        "🖼 Пришли 1–4 init-изображения (фото или файлом), потом /done.\n"
-        "/cancel — отменить."
+        "Пришли 1–4 исходные картинки (фото или файлом). "
+        "Когда закончишь — отправь /done. /cancel — отменить."
     )
     return I2I_COLLECT
 
@@ -791,12 +692,16 @@ async def i2i_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     path = await _download_image(update, ctx, log)
     if not path:
         log.warning("non-image payload in I2I_COLLECT")
-        await update.message.reply_text("⚠️ Это не картинка. Пришли photo или image-document.")
+        await update.message.reply_text(
+            "Это не картинка. Пришли фото или файл-изображение."
+        )
         return I2I_COLLECT
     ctx.user_data["init_paths"].append(path)
     n = len(ctx.user_data["init_paths"])
     log.info(f"collected init image #{n}: {path.name}")
-    await update.message.reply_text(f"📥 принято {n}. Ещё или /done.")
+    await update.message.reply_text(
+        f"Принято: {n} из 4. Можешь прислать ещё или отправь /done."
+    )
     return I2I_COLLECT
 
 
@@ -809,7 +714,9 @@ async def i2i_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("Сначала пришли хотя бы одну картинку.")
         return I2I_COLLECT
     log.info(f"done collecting, total={n}; waiting for prompt")
-    await update.message.reply_text("✍️ Теперь текст промпта (или /cancel):")
+    await update.message.reply_text(
+        "Теперь опиши, как изменить эти картинки. /cancel — выйти."
+    )
     return I2I_PROMPT
 
 
@@ -819,125 +726,15 @@ async def i2i_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     prompt = (update.message.text or "").strip()
     if not prompt:
         log.warning("empty prompt for img2img")
-        await update.message.reply_text("Пустой prompt. Попробуй ещё раз или /cancel.")
+        await update.message.reply_text(
+            "Пустое описание. Пришли текст ещё раз или /cancel."
+        )
         return I2I_PROMPT
     ctx.user_data["prompt"] = prompt
-    log.info(f"prompt received: chars={len(prompt)}; asking for node")
+    log.info(f"prompt received: chars={len(prompt)} prompt={_escape_prompt(prompt)!r}; asking for ratio")
     await update.message.reply_text(
-        f"Выбери ноду:\n"
-        f"• Nano Banana — {_fmt_eta(ETA_NANO_BANANA_SEC)} на картинку\n"
-        f"• GPT Image 2 — {_fmt_eta(ETA_GPT_IMAGE_SEC)} на картинку",
-        reply_markup=_kb("node", NODES, cols=2),
-    )
-    return I2I_NODE
-
-
-@whitelist_only
-async def i2i_node(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    node = q.data.split(":", 1)[1]
-    log = _ulog(update, "/img2img")
-    ctx.user_data["node"] = node
-    log.info(f"node picked: {node}")
-    if node == "gpt":
-        await _ask_gpt_quality(q)
-        return I2I_GPT_QUALITY
-    await q.answer()
-    await _edit_picked(q, "Модель", "Nano Banana")
-    await q.message.chat.send_message(
-        "Какой вариант модели?", reply_markup=_kb("model", GEMINI_MODELS, cols=2)
-    )
-    return I2I_MODEL
-
-
-@whitelist_only
-async def i2i_gpt_quality(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    quality = q.data.split(":", 1)[1]
-    ctx.user_data["gpt_quality"] = quality
-    _ulog(update, "/img2img").info(f"gpt quality: {quality}")
-    await _edit_picked(q, "Качество", quality)
-    await q.message.chat.send_message(
-        "Соотношение сторон / разрешение:",
-        reply_markup=_kb("gpta", GPT_ASPECTS, cols=3),
-    )
-    return I2I_GPT_ASPECT
-
-
-@whitelist_only
-async def i2i_gpt_aspect(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    aspect = q.data.split(":", 1)[1]
-    ctx.user_data["gpt_aspect"] = aspect
-    label = dict(GPT_ASPECTS).get(aspect, aspect)
-    _ulog(update, "/img2img").info(f"gpt aspect: {aspect}")
-    await _edit_picked(q, "Размер", label)
-    await q.message.chat.send_message(
-        "Фон:",
-        reply_markup=_kb("gptb", GPT_BACKGROUNDS, cols=3),
-    )
-    return I2I_GPT_BG
-
-
-@whitelist_only
-async def i2i_gpt_bg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    bg = q.data.split(":", 1)[1]
-    ctx.user_data["gpt_bg"] = bg
-    log = _ulog(update, "/img2img")
-    log.info(f"gpt background: {bg}; launching")
-    await _edit_picked(q, "Фон", bg)
-
-    prompt: str = ctx.user_data["prompt"]
-    init_paths: list[Path] = ctx.user_data["init_paths"]
-    quality = ctx.user_data.get("gpt_quality", "Medium")
-    aspect = ctx.user_data.get("gpt_aspect", "auto")
-    state = get_state()
-    u = update.effective_user
-    chat = update.effective_chat
-
-    async def runner() -> GenerationJob:
-        async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
-            wf = GPTImageWorkflow(
-                client, version="v2", aspect_ratio=aspect,
-                quality=quality, background=bg, number_of_images=1,
-            )
-            return await wf.run_with_files(prompt=prompt, init_paths=init_paths)
-
-    template = TaskRecipe(
-        task_uid="", user_id=u.id,
-        label=f"img2img-gpt/{quality}/{aspect}/{bg}",
-        workflow="gpt_i2i", prompt=prompt,
-        params={"quality": quality, "aspect": aspect, "bg": bg},
-    )
-    await _enqueue_task(
-        ctx=ctx,
-        uid=u.id,
-        uname=u.username or u.full_name or "?",
-        chat=chat,
-        runner=runner,
-        label=f"img2img-gpt/{quality}/{aspect}/{bg}",
-        eta_sec=ETA_GPT_IMAGE_SEC,
-        cleanup_paths=list(init_paths),
-        recipe_template=template,
-    )
-    return ConversationHandler.END
-
-
-@whitelist_only
-async def i2i_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    model = q.data.split(":", 1)[1]
-    ctx.user_data["model_name"] = model
-    label = dict(GEMINI_MODELS).get(model, model)
-    _ulog(update, "/img2img").info(f"model_name: {model}")
-    await _edit_picked(q, "Вариант", label)
-    await q.message.chat.send_message(
-        "Соотношение сторон:", reply_markup=_kb("ratio", GEMINI_RATIOS, cols=4)
+        "Выбери соотношение сторон. Кнопка «auto» — модель подберёт сама.",
+        reply_markup=_kb("ratio", GEMINI_RATIOS, cols=4),
     )
     return I2I_RATIO
 
@@ -952,7 +749,8 @@ async def i2i_ratio(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     _ulog(update, "/img2img").info(f"ratio: {ratio}")
     await _edit_picked(q, "Соотношение", label)
     await q.message.chat.send_message(
-        "Разрешение:", reply_markup=_kb("res", GEMINI_RESOLUTIONS, cols=4)
+        "Выбери разрешение. Кнопка «auto» — модель подберёт сама.",
+        reply_markup=_kb("res", GEMINI_RESOLUTIONS, cols=4),
     )
     return I2I_RES
 
@@ -970,13 +768,13 @@ async def i2i_res(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
     prompt = ctx.user_data["prompt"]
     init_paths: list[Path] = ctx.user_data["init_paths"]
-    model = ctx.user_data.get("model_name", "v3_1")
+    model = NANO_BANANA_MODEL
     ratio = ctx.user_data.get("ratio", "r_3_4")
     state = get_state()
     u = update.effective_user
     chat = update.effective_chat
 
-    async def runner() -> GenerationJob:
+    async def runner(progress_cb=None) -> GenerationJob:
         async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
             wf = ImageToImageWorkflow(
                 client, model_name=model, ratio=ratio, resolution=resolution
@@ -1019,7 +817,7 @@ async def sp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data["speaker_photo"] = None
     target = _first_message(update)
     await target.reply_text(
-        "👤 Пришли фото спикера (photo или файлом).\n/cancel — отменить."
+        "Пришли фото спикера (одно фото или файл-изображение). /cancel — отменить."
     )
     return SP_PHOTO
 
@@ -1030,18 +828,21 @@ async def sp_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     path = await _download_image(update, ctx, log)
     if not path:
         log.warning("non-image payload in SP_PHOTO")
-        await update.message.reply_text("⚠️ Это не картинка. Пришли фото.")
+        await update.message.reply_text("Это не картинка. Пришли фото.")
         return SP_PHOTO
     ctx.user_data["speaker_photo"] = path
     log.info(f"speaker photo saved: {path.name}")
     kb = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("👨 Мужчина", callback_data="gender:man"),
-            InlineKeyboardButton("👩 Женщина", callback_data="gender:woman"),
+            InlineKeyboardButton("Мужчина", callback_data="gender:man"),
+            InlineKeyboardButton("Женщина", callback_data="gender:woman"),
         ],
-        [InlineKeyboardButton("✖️ Отмена", callback_data="cancel:picker")],
+        [InlineKeyboardButton("Отмена", callback_data="cancel:picker")],
     ])
-    await update.message.reply_text("Кто на фото?", reply_markup=kb)
+    await update.message.reply_text(
+        "Кто на фото? Это нужно, чтобы подобрать подходящий промпт.",
+        reply_markup=kb,
+    )
     return SP_GENDER
 
 
@@ -1054,7 +855,7 @@ async def sp_gender(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     _ulog(update, "/prep_speaker").info(f"gender: {gender}")
     await _edit_picked(q, "Пол", "Мужчина" if gender == "man" else "Женщина")
     await q.message.chat.send_message(
-        "Соотношение сторон (рекомендовано 3:4):",
+        "Выбери соотношение сторон. Для портрета спикера обычно лучше 3:4.",
         reply_markup=_kb("ratio", GEMINI_RATIOS, cols=4),
     )
     return SP_RATIO
@@ -1070,7 +871,7 @@ async def sp_ratio(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     _ulog(update, "/prep_speaker").info(f"ratio: {ratio}")
     await _edit_picked(q, "Соотношение", label)
     await q.message.chat.send_message(
-        "Разрешение (рекомендовано 2K):",
+        "Выбери разрешение. Для портрета спикера обычно достаточно 2K.",
         reply_markup=_kb("res", GEMINI_RESOLUTIONS, cols=4),
     )
     return SP_RES
@@ -1095,7 +896,7 @@ async def sp_res(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     u = update.effective_user
     chat = update.effective_chat
 
-    async def runner() -> GenerationJob:
+    async def runner(progress_cb=None) -> GenerationJob:
         async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
             wf = build_speaker_prep_workflow(client)
             # Перебиваем дефолтные параметры выбором пользователя.
@@ -1121,6 +922,242 @@ async def sp_res(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         label=f"prep-speaker/{gender}/{ratio}/{resolution}",
         eta_sec=ETA_NANO_BANANA_SEC,
         cleanup_paths=[photo],
+        recipe_template=template,
+    )
+    return ConversationHandler.END
+
+
+# ── /brand_generate ────────────────────────────────────────────────────────
+# Brand-консистентный text→image: user text → Gemini Text (CloudRu Enhancer) → Nano Banana.
+@whitelist_only
+async def bt2i_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await _check_user_capacity(update):
+        return ConversationHandler.END
+    log = _ulog(update, "/brand_generate")
+    if update.callback_query:
+        try:
+            await update.callback_query.answer()
+        except Exception:
+            pass
+    target = _first_message(update)
+    args = (ctx.args or []) if update.message else []
+    if args:
+        prompt = " ".join(args).strip()
+        ctx.user_data["prompt"] = prompt
+        log.info(f"inline args: prompt_chars={len(prompt)} — asking for ratio")
+        await target.reply_text(
+            "Описание принято. Между текстом и Nano Banana встанет Gemini Text "
+            "(брендовый промпт Cloud.ru), это добавит ~30 сек к генерации.\n"
+            "Теперь выбери соотношение сторон.",
+            reply_markup=_kb("ratio", GEMINI_RATIOS, cols=4),
+        )
+        return BT2I_RATIO
+    log.info("entered prompt-collection state")
+    await target.reply_text(
+        "Опиши идею картинки в свободной форме. Gemini подготовит брендовый "
+        "промпт под Cloud.ru, потом Nano Banana нарисует. /cancel — выйти."
+    )
+    return BT2I_PROMPT
+
+
+@whitelist_only
+async def bt2i_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    log = _ulog(update, "/brand_generate")
+    prompt = (update.message.text or "").strip()
+    if not prompt:
+        log.warning("empty prompt, asking again")
+        await update.message.reply_text(
+            "Пустое описание. Пришли текст ещё раз или /cancel."
+        )
+        return BT2I_PROMPT
+    ctx.user_data["prompt"] = prompt
+    log.info(f"prompt received: chars={len(prompt)} prompt={_escape_prompt(prompt)!r}; asking for ratio")
+    await update.message.reply_text(
+        "Выбери соотношение сторон. Кнопка «auto» — модель подберёт сама.",
+        reply_markup=_kb("ratio", GEMINI_RATIOS, cols=4),
+    )
+    return BT2I_RATIO
+
+
+@whitelist_only
+async def bt2i_ratio(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    ratio = q.data.split(":", 1)[1]
+    ctx.user_data["ratio"] = ratio
+    label = dict(GEMINI_RATIOS).get(ratio, ratio)
+    _ulog(update, "/brand_generate").info(f"ratio: {ratio}")
+    await _edit_picked(q, "Соотношение", label)
+    await q.message.chat.send_message(
+        "Выбери разрешение. Кнопка «auto» — модель подберёт сама.",
+        reply_markup=_kb("res", GEMINI_RESOLUTIONS, cols=4),
+    )
+    return BT2I_RES
+
+
+@whitelist_only
+async def bt2i_res(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    resolution = q.data.split(":", 1)[1]
+    ctx.user_data["resolution"] = resolution
+    label = dict(GEMINI_RESOLUTIONS).get(resolution, resolution)
+    _ulog(update, "/brand_generate").info(f"resolution: {resolution}; launching")
+    await _edit_picked(q, "Разрешение", label)
+    await _bt2i_run(update, ctx)
+    return ConversationHandler.END
+
+
+async def _bt2i_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    prompt: str = ctx.user_data["prompt"]
+    model = NANO_BANANA_MODEL
+    ratio = ctx.user_data.get("ratio", "default")
+    resolution = ctx.user_data.get("resolution", "default")
+    state = get_state()
+    u = update.effective_user
+    chat = update.effective_chat
+
+    async def runner(progress_cb=None) -> GenerationJob:
+        async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
+            return await run_brand_text2img(
+                client, prompt=prompt, model_name=model, ratio=ratio, resolution=resolution,
+                progress_cb=progress_cb,
+            )
+
+    template = TaskRecipe(
+        task_uid="", user_id=u.id,
+        label=f"brand_t2i/{model}/{ratio}/{resolution}",
+        workflow="brand_t2i", prompt=prompt,
+        params={"model": model, "ratio": ratio, "resolution": resolution},
+    )
+    await _enqueue_task(
+        ctx=ctx,
+        uid=u.id,
+        uname=u.username or u.full_name or "?",
+        chat=chat,
+        runner=runner,
+        label=f"brand_t2i/{model}/{ratio}/{resolution}",
+        eta_sec=ETA_BRAND_SEC,
+        recipe_template=template,
+    )
+
+
+# ── /brand_img2img ─────────────────────────────────────────────────────────
+# Brand-консистентный image→image: user image(s) → Gemini Text (фикс. prompt + CloudRu Img2Img) → Nano Banana.
+@whitelist_only
+async def bi2i_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await _check_user_capacity(update):
+        return ConversationHandler.END
+    if update.callback_query:
+        try:
+            await update.callback_query.answer()
+        except Exception:
+            pass
+    _ulog(update, "/brand_img2img").info("started")
+    ctx.user_data["init_paths"] = []
+    target = _first_message(update)
+    await target.reply_text(
+        "Пришли 1–4 исходные картинки (фото или файлом). Описание не нужно — "
+        "Gemini Text сам подготовит брендовый промпт под Cloud.ru.\n"
+        "Когда закончишь — отправь /done. /cancel — отменить."
+    )
+    return BI2I_COLLECT
+
+
+@whitelist_only
+async def bi2i_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    log = _ulog(update, "/brand_img2img")
+    path = await _download_image(update, ctx, log)
+    if not path:
+        log.warning("non-image payload in BI2I_COLLECT")
+        await update.message.reply_text(
+            "Это не картинка. Пришли фото или файл-изображение."
+        )
+        return BI2I_COLLECT
+    ctx.user_data["init_paths"].append(path)
+    n = len(ctx.user_data["init_paths"])
+    log.info(f"collected init image #{n}: {path.name}")
+    await update.message.reply_text(
+        f"Принято: {n} из 4. Можешь прислать ещё или отправь /done."
+    )
+    return BI2I_COLLECT
+
+
+@whitelist_only
+async def bi2i_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    log = _ulog(update, "/brand_img2img")
+    n = len(ctx.user_data.get("init_paths") or [])
+    if not n:
+        log.warning("/done before any image")
+        await update.message.reply_text("Сначала пришли хотя бы одну картинку.")
+        return BI2I_COLLECT
+    log.info(f"done collecting, total={n}; asking for ratio")
+    await update.message.reply_text(
+        "Выбери соотношение сторон. Кнопка «auto» — модель подберёт сама.",
+        reply_markup=_kb("ratio", GEMINI_RATIOS, cols=4),
+    )
+    return BI2I_RATIO
+
+
+@whitelist_only
+async def bi2i_ratio(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    ratio = q.data.split(":", 1)[1]
+    ctx.user_data["ratio"] = ratio
+    label = dict(GEMINI_RATIOS).get(ratio, ratio)
+    _ulog(update, "/brand_img2img").info(f"ratio: {ratio}")
+    await _edit_picked(q, "Соотношение", label)
+    await q.message.chat.send_message(
+        "Выбери разрешение. Кнопка «auto» — модель подберёт сама.",
+        reply_markup=_kb("res", GEMINI_RESOLUTIONS, cols=4),
+    )
+    return BI2I_RES
+
+
+@whitelist_only
+async def bi2i_res(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    resolution = q.data.split(":", 1)[1]
+    ctx.user_data["resolution"] = resolution
+    label = dict(GEMINI_RESOLUTIONS).get(resolution, resolution)
+    log = _ulog(update, "/brand_img2img")
+    log.info(f"resolution: {resolution}; launching")
+    await _edit_picked(q, "Разрешение", label)
+
+    init_paths: list[Path] = ctx.user_data["init_paths"]
+    model = NANO_BANANA_MODEL
+    ratio = ctx.user_data.get("ratio", "r_3_4")
+    state = get_state()
+    u = update.effective_user
+    chat = update.effective_chat
+
+    async def runner(progress_cb=None) -> GenerationJob:
+        async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
+            return await run_brand_img2img(
+                client, init_paths=init_paths,
+                model_name=model, ratio=ratio, resolution=resolution,
+                progress_cb=progress_cb,
+            )
+
+    # prompt в recipe — пустая строка: пользовательского текста нет, фикс. "Read the System Prompt"
+    # держим в композере. Кнопка «Изменить текст» в _action_keyboard для brand_i2i скрыта.
+    template = TaskRecipe(
+        task_uid="", user_id=u.id,
+        label=f"brand_i2i/{model}/{ratio}/{resolution}",
+        workflow="brand_i2i", prompt="",
+        params={"model": model, "ratio": ratio, "resolution": resolution},
+    )
+    await _enqueue_task(
+        ctx=ctx,
+        uid=u.id,
+        uname=u.username or u.full_name or "?",
+        chat=chat,
+        runner=runner,
+        label=f"brand_i2i/{model}/{ratio}/{resolution}",
+        eta_sec=ETA_BRAND_SEC,
+        cleanup_paths=list(init_paths),
         recipe_template=template,
     )
     return ConversationHandler.END
@@ -1170,7 +1207,10 @@ async def _download_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE, log) -
 async def cmd_menu(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Показать главное меню inline-кнопками."""
     _ulog(update, "/menu").info("menu opened")
-    await update.message.reply_text("Меню:", reply_markup=MENU_KEYBOARD)
+    await update.message.reply_text(
+        "Главное меню. Выбери, что сделать:",
+        reply_markup=MENU_KEYBOARD,
+    )
 
 
 @whitelist_only
@@ -1200,12 +1240,12 @@ async def regen_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_state()
     recipe = state.get_recipe(task_uid)
     if recipe is None:
-        await q.answer("⚠️ Параметры этой задачи устарели (>24ч).")
+        await q.answer("Параметры устарели (старше 24 часов).")
         return
     if not await _check_user_capacity_cb(update):
         await q.answer()
         return
-    await q.answer("🔄 Повторяю с теми же параметрами…")
+    await q.answer("Повторяю с теми же параметрами.")
     _ulog(update, "regen").info(f"from task={task_uid} workflow={recipe.workflow}")
     await _rerun_from_recipe(ctx, update, recipe, prompt_override=None)
 
@@ -1218,7 +1258,7 @@ async def edit_prompt_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     state = get_state()
     recipe = state.get_recipe(task_uid)
     if recipe is None:
-        await q.answer("⚠️ Параметры этой задачи устарели (>24ч).")
+        await q.answer("Параметры устарели (старше 24 часов).")
         return
     await q.answer()
     uid = update.effective_user.id
@@ -1226,11 +1266,11 @@ async def edit_prompt_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     _ulog(update, "edit-prompt").info(f"pending edit set for task={task_uid}")
     safe = html.escape(recipe.prompt)
     await q.message.reply_text(
-        "✏️ Текущий промпт (скопируй из код-блока, отредактируй и отправь следующим сообщением):\n\n"
+        "Текущее описание ниже. Скопируй из код-блока, поправь и пришли следующим сообщением.\n\n"
         f"<pre>{safe}</pre>\n\n"
-        "Жду новый промпт ~5 минут. /cancel — отменить.\n"
-        "⚠️ Если ты сейчас в активном сценарии (/generate, /img2img, /prep_speaker) — "
-        "сначала /cancel, иначе твой текст уйдёт туда.",
+        "Жду новый текст около 5 минут. /cancel — отменить.\n"
+        "Если ты сейчас внутри другого сценария (/generate, /img2img, /prep_speaker), "
+        "сначала выйди через /cancel — иначе текст уйдёт туда.",
         parse_mode="HTML",
     )
 
@@ -1250,12 +1290,12 @@ async def pending_edit_listener(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
     recipe = state.get_recipe(task_uid)
     if recipe is None:
         await update.message.reply_text(
-            "⚠️ Параметры исходной задачи устарели — повтор недоступен."
+            "Параметры исходной задачи устарели — повтор недоступен."
         )
         return
     new_prompt = (update.message.text or "").strip()
     if not new_prompt:
-        await update.message.reply_text("⚠️ Пустой промпт, отменено.")
+        await update.message.reply_text("Пустое описание — отменено.")
         return
     if not await _check_user_capacity(update):
         return
@@ -1273,12 +1313,12 @@ async def as_i2i_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     state = get_state()
     recipe = state.get_recipe(task_uid)
     if recipe is None or recipe.result_path is None or not recipe.result_path.exists():
-        await q.answer("⚠️ Картинка устарела или не сохранилась локально.")
+        await q.answer("Картинка устарела или не сохранилась локально.")
         return ConversationHandler.END
     if not await _check_user_capacity(update):
         await q.answer()
         return ConversationHandler.END
-    await q.answer("Беру эту картинку как init.")
+    await q.answer("Беру эту картинку как исходник.")
 
     uid = update.effective_user.id
     user_tmp = state.user_tmp(uid)
@@ -1288,16 +1328,55 @@ async def as_i2i_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         shutil.copyfile(recipe.result_path, dst)
     except Exception as e:
         _ulog(update, "asi2i").warning(f"copy failed: {e!r}")
-        await q.message.reply_text("⚠️ Не смог подготовить картинку. Попробуй ещё раз.")
+        await q.message.reply_text("Не смог подготовить картинку. Попробуй ещё раз.")
         return ConversationHandler.END
 
     ctx.user_data["init_paths"] = [dst]
     _ulog(update, "/img2img").info(f"asi2i: started from task={task_uid}, init={dst.name}")
     await q.message.reply_text(
-        "🖼 Использую эту картинку как init.\n"
-        "Можешь прислать ещё фото или сразу /done."
+        "Использую эту картинку как исходник. "
+        "Можешь прислать ещё фото (до 4 всего) или сразу отправить /done."
     )
     return I2I_COLLECT
+
+
+@whitelist_only
+async def as_brand_i2i_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """🖼 Использовать результат как init для brand_img2img — entry в conv_brand_i2i.
+    Промпт не нужен (фикс. в композере), но collect-фазу оставляем — юзер может добавить
+    ещё картинок до /done."""
+    q = update.callback_query
+    task_uid = q.data.split(":", 1)[1]
+    state = get_state()
+    recipe = state.get_recipe(task_uid)
+    if recipe is None or recipe.result_path is None or not recipe.result_path.exists():
+        await q.answer("Картинка устарела или не сохранилась локально.")
+        return ConversationHandler.END
+    if not await _check_user_capacity(update):
+        await q.answer()
+        return ConversationHandler.END
+    await q.answer("Беру эту картинку для brand img2img.")
+
+    uid = update.effective_user.id
+    user_tmp = state.user_tmp(uid)
+    suffix = recipe.result_path.suffix or ".png"
+    dst = user_tmp / f"asbi2i_{int(time.time() * 1000)}{suffix}"
+    try:
+        shutil.copyfile(recipe.result_path, dst)
+    except Exception as e:
+        _ulog(update, "asbi2i").warning(f"copy failed: {e!r}")
+        await q.message.reply_text("Не смог подготовить картинку. Попробуй ещё раз.")
+        return ConversationHandler.END
+
+    ctx.user_data["init_paths"] = [dst]
+    _ulog(update, "/brand_img2img").info(
+        f"asbi2i: started from task={task_uid}, init={dst.name}"
+    )
+    await q.message.reply_text(
+        "Использую эту картинку для брендовой генерации (Gemini сам опишет). "
+        "Можешь прислать ещё фото (до 4 всего) или сразу отправить /done."
+    )
+    return BI2I_COLLECT
 
 
 # ── _rerun_from_recipe ─────────────────────────────────────────────────────
@@ -1314,13 +1393,17 @@ async def _rerun_from_recipe(
     chat = update.effective_chat
     prompt = prompt_override if prompt_override is not None else recipe.prompt
     params = recipe.params
+    action = "edit" if prompt_override is not None else "regen"
+    logger.bind(uid=u.id, action=action, workflow=recipe.workflow).info(
+        f"rerun: workflow={recipe.workflow} chars={len(prompt)} prompt={_escape_prompt(prompt)!r}"
+    )
 
     if recipe.workflow == "nb_t2i":
-        model = params.get("model", "v3")
+        model = NANO_BANANA_MODEL
         ratio = params.get("ratio", "default")
         resolution = params.get("resolution", "default")
 
-        async def runner() -> GenerationJob:
+        async def runner(progress_cb=None) -> GenerationJob:
             async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
                 wf = ImageGenWorkflow(client, model_name=model, ratio=ratio, resolution=resolution)
                 return await wf.run(prompt=prompt)
@@ -1330,33 +1413,15 @@ async def _rerun_from_recipe(
         cleanup = []
         new_workflow = "nb_t2i"
 
-    elif recipe.workflow == "gpt_t2i":
-        quality = params.get("quality", "Medium")
-        aspect = params.get("aspect", "auto")
-        bg = params.get("bg", "auto")
-
-        async def runner() -> GenerationJob:
-            async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
-                wf = GPTImageWorkflow(
-                    client, version="v2", aspect_ratio=aspect,
-                    quality=quality, background=bg, number_of_images=1,
-                )
-                return await wf.run(prompt=prompt)
-
-        label = f"generate-gpt/{quality}/{aspect}/{bg}"
-        eta = ETA_GPT_IMAGE_SEC
-        cleanup = []
-        new_workflow = "gpt_t2i"
-
     elif recipe.workflow == "nb_i2i":
-        model = params.get("model", "v3_1")
+        model = NANO_BANANA_MODEL
         ratio = params.get("ratio", "r_3_4")
         resolution = params.get("resolution", "default")
         # Готовим init-пути в свежем task_tmp — нельзя пускать regen_cache напрямую,
         # потому что cleanup_paths их потом удалит после задачи.
         init_paths = _stage_inits_from_recipe(state, u.id, recipe)
 
-        async def runner() -> GenerationJob:
+        async def runner(progress_cb=None) -> GenerationJob:
             async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
                 wf = ImageToImageWorkflow(client, model_name=model, ratio=ratio, resolution=resolution)
                 return await wf.run_with_files(prompt=prompt, init_paths=init_paths)
@@ -1366,24 +1431,46 @@ async def _rerun_from_recipe(
         cleanup = list(init_paths)
         new_workflow = "nb_i2i"
 
-    elif recipe.workflow == "gpt_i2i":
-        quality = params.get("quality", "Medium")
-        aspect = params.get("aspect", "auto")
-        bg = params.get("bg", "auto")
-        init_paths = _stage_inits_from_recipe(state, u.id, recipe)
+    elif recipe.workflow == "brand_t2i":
+        model = NANO_BANANA_MODEL
+        ratio = params.get("ratio", "default")
+        resolution = params.get("resolution", "default")
 
-        async def runner() -> GenerationJob:
+        async def runner(progress_cb=None) -> GenerationJob:
             async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
-                wf = GPTImageWorkflow(
-                    client, version="v2", aspect_ratio=aspect,
-                    quality=quality, background=bg, number_of_images=1,
+                return await run_brand_text2img(
+                    client, prompt=prompt, model_name=model,
+                    ratio=ratio, resolution=resolution,
+                    progress_cb=progress_cb,
                 )
-                return await wf.run_with_files(prompt=prompt, init_paths=init_paths)
 
-        label = f"img2img-gpt/{quality}/{aspect}/{bg}"
-        eta = ETA_GPT_IMAGE_SEC
+        label = f"brand_t2i/{model}/{ratio}/{resolution}"
+        eta = ETA_BRAND_SEC
+        cleanup = []
+        new_workflow = "brand_t2i"
+
+    elif recipe.workflow == "brand_i2i":
+        model = NANO_BANANA_MODEL
+        ratio = params.get("ratio", "r_3_4")
+        resolution = params.get("resolution", "default")
+        # init-картинки переезжают в свежий task_tmp, чтобы cleanup_paths их потом удалил.
+        init_paths = _stage_inits_from_recipe(state, u.id, recipe)
+        if not init_paths:
+            await chat.send_message("Не нашёл локальной копии исходников для повтора.")
+            return
+
+        async def runner(progress_cb=None) -> GenerationJob:
+            async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
+                return await run_brand_img2img(
+                    client, init_paths=init_paths,
+                    model_name=model, ratio=ratio, resolution=resolution,
+                    progress_cb=progress_cb,
+                )
+
+        label = f"brand_i2i/{model}/{ratio}/{resolution}"
+        eta = ETA_BRAND_SEC
         cleanup = list(init_paths)
-        new_workflow = "gpt_i2i"
+        new_workflow = "brand_i2i"
 
     elif recipe.workflow == "speaker":
         gender = params.get("gender", "man")
@@ -1393,13 +1480,13 @@ async def _rerun_from_recipe(
         # Но в recipe.init_paths мы сохранили только cleanup_paths, т.е. без DEFAULT_REFERENCE.
         init_paths = _stage_inits_from_recipe(state, u.id, recipe)
         if not init_paths:
-            await chat.send_message("⚠️ Не нашёл локальной копии фото спикера для повтора.")
+            await chat.send_message("Не нашёл локальной копии фото спикера для повтора.")
             return
         speaker_photo = init_paths[0]
         # Если ✏️ Уточнить вызвал regen — prompt в recipe собран из speaker_prompt(gender);
         # юзерский override применяем как есть (он же и редактирует этот системный промпт).
 
-        async def runner() -> GenerationJob:
+        async def runner(progress_cb=None) -> GenerationJob:
             async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
                 wf = build_speaker_prep_workflow(client)
                 wf.ratio = ratio
@@ -1414,7 +1501,9 @@ async def _rerun_from_recipe(
         new_workflow = "speaker"
 
     else:
-        await chat.send_message(f"⚠️ Не знаю как повторить workflow={recipe.workflow}")
+        await chat.send_message(
+            f"Не знаю, как повторить этот тип задачи (workflow={recipe.workflow})."
+        )
         return
 
     new_template = TaskRecipe(
@@ -1472,13 +1561,8 @@ def build_conversations() -> list[ConversationHandler]:
         ],
         states={
             GEN_PROMPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, gen_prompt)],
-            GEN_NODE: [CallbackQueryHandler(gen_node, pattern=r"^node:(nb|gpt)$")],
-            GEN_MODEL: [CallbackQueryHandler(gen_model, pattern=r"^model:")],
             GEN_RATIO: [CallbackQueryHandler(gen_ratio, pattern=r"^ratio:")],
             GEN_RES: [CallbackQueryHandler(gen_res, pattern=r"^res:")],
-            GEN_GPT_QUALITY: [CallbackQueryHandler(gen_gpt_quality, pattern=r"^gptq:")],
-            GEN_GPT_ASPECT: [CallbackQueryHandler(gen_gpt_aspect, pattern=r"^gpta:")],
-            GEN_GPT_BG: [CallbackQueryHandler(gen_gpt_bg, pattern=r"^gptb:")],
         },
         fallbacks=cancel_handlers,
         name="generate",
@@ -1497,13 +1581,8 @@ def build_conversations() -> list[ConversationHandler]:
                 CommandHandler("done", i2i_done),
             ],
             I2I_PROMPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, i2i_prompt)],
-            I2I_NODE: [CallbackQueryHandler(i2i_node, pattern=r"^node:(nb|gpt)$")],
-            I2I_MODEL: [CallbackQueryHandler(i2i_model, pattern=r"^model:")],
             I2I_RATIO: [CallbackQueryHandler(i2i_ratio, pattern=r"^ratio:")],
             I2I_RES: [CallbackQueryHandler(i2i_res, pattern=r"^res:")],
-            I2I_GPT_QUALITY: [CallbackQueryHandler(i2i_gpt_quality, pattern=r"^gptq:")],
-            I2I_GPT_ASPECT: [CallbackQueryHandler(i2i_gpt_aspect, pattern=r"^gpta:")],
-            I2I_GPT_BG: [CallbackQueryHandler(i2i_gpt_bg, pattern=r"^gptb:")],
         },
         fallbacks=cancel_handlers,
         name="img2img",
@@ -1526,7 +1605,41 @@ def build_conversations() -> list[ConversationHandler]:
         persistent=False,
     )
 
-    return [conv_generate, conv_img2img, conv_prep]
+    conv_brand_t2i = ConversationHandler(
+        entry_points=[
+            CommandHandler("brand_generate", bt2i_start),
+            CallbackQueryHandler(bt2i_start, pattern=r"^menu:brand_generate$"),
+        ],
+        states={
+            BT2I_PROMPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, bt2i_prompt)],
+            BT2I_RATIO: [CallbackQueryHandler(bt2i_ratio, pattern=r"^ratio:")],
+            BT2I_RES: [CallbackQueryHandler(bt2i_res, pattern=r"^res:")],
+        },
+        fallbacks=cancel_handlers,
+        name="brand_generate",
+        persistent=False,
+    )
+
+    conv_brand_i2i = ConversationHandler(
+        entry_points=[
+            CommandHandler("brand_img2img", bi2i_start),
+            CallbackQueryHandler(bi2i_start, pattern=r"^menu:brand_img2img$"),
+            CallbackQueryHandler(as_brand_i2i_cb, pattern=r"^asbi2i:"),
+        ],
+        states={
+            BI2I_COLLECT: [
+                MessageHandler(img_filter, bi2i_photo),
+                CommandHandler("done", bi2i_done),
+            ],
+            BI2I_RATIO: [CallbackQueryHandler(bi2i_ratio, pattern=r"^ratio:")],
+            BI2I_RES: [CallbackQueryHandler(bi2i_res, pattern=r"^res:")],
+        },
+        fallbacks=cancel_handlers,
+        name="brand_img2img",
+        persistent=False,
+    )
+
+    return [conv_generate, conv_img2img, conv_prep, conv_brand_t2i, conv_brand_i2i]
 
 
 def build_extra_handlers() -> list:

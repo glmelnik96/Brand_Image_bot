@@ -22,6 +22,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# Под Windows stdout/stderr по умолчанию cp1251 — Unicode-эмодзи/стрелки в выводе
+# валят cli с UnicodeEncodeError. Переключаем явно.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        pass
+
 import httpx
 import truststore
 from loguru import logger

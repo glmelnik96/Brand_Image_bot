@@ -12,6 +12,14 @@ import ssl
 import sys
 from pathlib import Path
 
+# Под Windows stdout/stderr по умолчанию cp1251 — loguru пишет в stderr Unicode-сообщения
+# (эмодзи, стрелки в логах), которые валят процесс UnicodeEncodeError. Переключаем явно.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        pass
+
 from loguru import logger
 from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler, ContextTypes, TypeHandler
@@ -25,34 +33,39 @@ from client.config import settings
 
 # ── /start, /help ──────────────────────────────────────────────────────────
 HELP_TEXT = (
-    "Phygital+ bot.\n\n"
-    "Кнопочное меню: /start или /menu — выбор сценария кнопками.\n\n"
-    "Команды:\n"
-    "• /generate — text→image. Спросит prompt → ноду → модель → ratio → resolution.\n"
-    "• /img2img — image→image. 1–4 init-картинки → /done → prompt → ноду → параметры.\n"
-    "• /prep_speaker — обработать фото спикера. Фото → man/woman → ratio → resolution.\n"
-    "• /menu — главное меню.\n"
-    "• /cancel — отменить текущий сценарий (есть и inline-кнопка «✖️ Отмена» в пикерах).\n"
+    "Phygital+ bot — генерация и редактирование картинок.\n\n"
+    "Базовые сценарии (Nano Banana напрямую):\n"
+    "• /generate — создать картинку по текстовому описанию.\n"
+    "• /img2img — изменить готовые картинки по описанию (1–4 исходника).\n"
+    "• /prep_speaker — обработать фото спикера.\n\n"
+    "Брендовые сценарии (Gemini Text → Nano Banana, +~30 сек):\n"
+    "• /brand_generate — текст → Gemini готовит брендовый промпт под Cloud.ru → картинка.\n"
+    "• /brand_img2img — 1–4 картинки → Gemini сам описывает их по брендовому промпту → новая картинка.\n\n"
+    "Общие команды:\n"
+    "• /menu — главное меню с кнопками.\n"
+    "• /cancel — выйти из текущего сценария (или нажать «Отмена» в пикере).\n"
     "• /help — это сообщение.\n\n"
-    "Ноды: 🍌 Nano Banana (Gemini Image API) и 🤖 GPT Image 2.\n\n"
-    "Ориентир по времени (откалибровано по логам, см. /menu для актуального ETA):\n"
-    "• Nano Banana — ~30–60 сек на картинку\n"
-    "• GPT Image 2 — ~8–9 мин на картинку\n"
-    "• /prep_speaker — ~30–60 сек (ходит через Nano Banana)\n\n"
-    "После каждого готового результата — три кнопки:\n"
-    "• 🔄 Повторить — те же параметры, тот же промпт.\n"
-    "• ✏️ Уточнить — изменить промпт (бот пришлёт исходный в код-блоке для копирования).\n"
-    "• 🖼 Как img2img — использовать этот результат как init для нового image→image.\n"
-    "Действия живут 24ч.\n\n"
-    f"Лимиты: глобально {settings.bot_max_concurrency} задач, "
-    f"на пользователя — до {MAX_PER_USER_INFLIGHT} в работе + очередь до {USER_QUEUE_LIMIT}."
+    "Модель: Nano Banana (Gemini Image API), версия 3.1 Pro.\n"
+    "Время на одну картинку — ориентировочно 30–60 секунд "
+    "(брендовые сценарии — 60–120 сек, два task'а подряд).\n\n"
+    "Под каждой готовой картинкой появятся кнопки:\n"
+    "• Повторить — заново с теми же параметрами (брендовые сценарии каждый раз "
+    "генерируют новый промпт от Gemini → результат будет другой).\n"
+    "• Изменить текст — поправить описание и перегенерировать; "
+    "бот пришлёт исходный текст в код-блоке для копирования. "
+    "У /brand_img2img этой кнопки нет — там пользовательского текста нет.\n"
+    "• В img2img — использовать эту картинку как исходник для нового запроса.\n"
+    "Кнопки активны 24 часа после получения картинки.\n\n"
+    f"Лимиты: всего {settings.bot_max_concurrency} задач одновременно, "
+    f"на пользователя — до {MAX_PER_USER_INFLIGHT} в работе плюс очередь до {USER_QUEUE_LIMIT}."
 )
 
 
 @whitelist_only
 async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Phygital+ bot. Выбери действие или жми /help.",
+        "Привет! Это Phygital+ bot — генерация и редактирование картинок.\n"
+        "Выбери сценарий кнопкой ниже или открой /help, если нужны подробности.",
         reply_markup=MENU_KEYBOARD,
     )
 
@@ -168,6 +181,8 @@ async def _post_init(app: Application) -> None:
             BotCommand("menu", "Главное меню (кнопки)"),
             BotCommand("generate", "Сгенерировать по тексту"),
             BotCommand("img2img", "Image→image: картинки + промпт"),
+            BotCommand("brand_generate", "Брендовая картинка по тексту (Cloud.ru)"),
+            BotCommand("brand_img2img", "Брендовая обработка картинок (Cloud.ru)"),
             BotCommand("prep_speaker", "Обработать фото спикера"),
             BotCommand("cancel", "Отменить текущий сценарий"),
             BotCommand("help", "Справка"),
@@ -198,7 +213,9 @@ async def _preflight_session(state) -> None:
         logger.opt(exception=e).error(f"Pre-flight: refresh не удался: {e}")
         raise SystemExit(
             f"Сессия Phygital мертва: {e}\n"
-            "Сделай свежий recon: .venv/bin/python -m recon.capture\n"
+            "Сделай свежий recon:\n"
+            "  Windows: .venv\\Scripts\\python -m recon.capture\n"
+            "  macOS/Linux: .venv/bin/python -m recon.capture\n"
             "После этого бот сам подхватит storage-*.json при старте."
         )
 

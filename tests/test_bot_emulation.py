@@ -2,7 +2,8 @@
 
 Цель: проверить новые фичи end-to-end на уровне хендлеров и `BotState`:
   1) menu-callback `menu:generate` поднимает /generate-сценарий и переводит в GEN_PROMPT;
-  2) /generate-флоу (Nano Banana) проходит от prompt → node → model → ratio → resolution;
+  2) /generate-флоу (Nano Banana v3.1) проходит prompt → ratio → resolution
+     (node-picker и model-picker сняты — модель зашита);
   3) worker реально запускает `_execute_task`, скачивает «картинку», сохраняет recipe;
   4) 🔄 Повторить (regen_cb) — повторно ставит задачу с теми же параметрами;
   5) ✏️ Уточнить (edit_prompt_cb) — ставит pending_edit; следующий текст идёт через
@@ -19,7 +20,7 @@
   - `httpx.AsyncClient`             → CM с .get() возвращающий байты PNG-«магического числа».
   - `settings.allowed_user_ids`     → пусто, `_is_allowed` пропустит любого uid.
 
-Запуск: `.venv/bin/python -m tests.test_bot_emulation`
+Запуск (после активации venv): `python -m tests.test_bot_emulation`
 """
 from __future__ import annotations
 
@@ -29,6 +30,14 @@ import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
+
+# Под Windows stdout/stderr по умолчанию cp1251 — выводим Unicode-баннеры/эмодзи
+# в utf-8 явно, иначе UnicodeEncodeError на первом же ━.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        pass
 
 # Один минимальный PNG (8-байтная сигнатура + IHDR), на отправку этого Telegram-mock плевать.
 FAKE_PNG_BYTES = (
@@ -198,24 +207,12 @@ async def scenario_full_generate_with_post_actions():
     upd.callback_query.answer.assert_awaited()  # callback подтверждён
     print("  ✓ menu:generate → GEN_PROMPT")
 
-    # === 2. prompt ===
+    # === 2. prompt → сразу GEN_RATIO (нода Nano Banana и модель v3.1 зашиты) ===
     upd = make_message_update("a happy banana on a beach", user, chat)
     state_id = await scn.gen_prompt(upd, ctx)
-    assert state_id == scn.GEN_NODE
-    assert ctx.user_data["prompt"] == "a happy banana on a beach"
-    print("  ✓ prompt → GEN_NODE")
-
-    # === 3. node = nb ===
-    upd = make_callback_update("node:nb", user, chat)
-    state_id = await scn.gen_node(upd, ctx)
-    assert state_id == scn.GEN_MODEL
-    print("  ✓ node:nb → GEN_MODEL")
-
-    # === 4. model = v3_1 ===
-    upd = make_callback_update("model:v3_1", user, chat)
-    state_id = await scn.gen_model(upd, ctx)
     assert state_id == scn.GEN_RATIO
-    print("  ✓ model:v3_1 → GEN_RATIO")
+    assert ctx.user_data["prompt"] == "a happy banana on a beach"
+    print("  ✓ prompt → GEN_RATIO (node/model pickers сняты)")
 
     # === 5. ratio = r_1_1 ===
     upd = make_callback_update("ratio:r_1_1", user, chat)
@@ -249,11 +246,12 @@ async def scenario_full_generate_with_post_actions():
     last_call = chat.send_photo.await_args
     assert "reply_markup" in last_call.kwargs, "action keyboard must be attached"
     kb = last_call.kwargs["reply_markup"]
-    btns = kb.inline_keyboard[0]
+    btns = [b for row in kb.inline_keyboard for b in row]
     assert any("Повторить" in b.text for b in btns)
-    assert any("Уточнить" in b.text for b in btns)
-    assert any("img2img" in b.text for b in btns)
-    print("  ✓ result отправлен с inline-клавиатурой [Повторить/Уточнить/Как img2img]")
+    assert any("Изменить текст" in b.text for b in btns)
+    assert any("В img2img" == b.text for b in btns)
+    assert any("В brand img2img" == b.text for b in btns)
+    print("  ✓ result отправлен с inline-клавиатурой [Повторить/Изменить текст/В img2img/В brand img2img]")
 
     # Verify: recipe сохранён
     recipes = list(state.recipes.values())
@@ -322,6 +320,18 @@ async def scenario_full_generate_with_post_actions():
     assert init.exists()
     print(f"  ✓ asi2i: вошли в I2I_COLLECT, init предзагружен: {init.name}")
 
+    # === 9b. 🖼 Как brand img2img ===
+    # asbi2i на t2i-результат: должен зайти в brand_img2img-конверсейшн (BI2I_COLLECT)
+    ctx.user_data.clear()
+    upd = make_callback_update(f"asbi2i:{recipe.task_uid}", user, chat)
+    state_id = await scn.as_brand_i2i_cb(upd, ctx)
+    assert state_id == scn.BI2I_COLLECT, f"asbi2i must return BI2I_COLLECT, got {state_id}"
+    assert "init_paths" in ctx.user_data and len(ctx.user_data["init_paths"]) == 1
+    init_b = ctx.user_data["init_paths"][0]
+    assert init_b.exists()
+    assert init_b.name.startswith("asbi2i_"), f"expected asbi2i_ prefix, got {init_b.name}"
+    print(f"  ✓ asbi2i: вошли в BI2I_COLLECT, init предзагружен: {init_b.name}")
+
     # === 10. cancel:picker (inline-кнопка отмены) ===
     upd = make_callback_update("cancel:picker", user, chat)
     state_id = await scn.cmd_cancel(upd, ctx)
@@ -369,6 +379,179 @@ async def scenario_menu_help_callback():
     print("  ✓ menu:help → HELP_TEXT отправлен")
 
 
+def make_async_func_mock(captured: dict, *, name: str):
+    """Возвращает AsyncMock с side_effect, сохраняющим kwargs в captured["calls"]."""
+    fake_job = FakeJob()
+
+    async def fn(*args, **kwargs):
+        captured.setdefault("calls", []).append({"name": name, "args": args, "kwargs": kwargs})
+        return fake_job
+
+    return fn
+
+
+async def scenario_brand_t2i_flow():
+    """Brand t2i: prompt → ratio → res → enqueue. Recipe.workflow='brand_t2i',
+    kb с тремя кнопками (Повторить/Изменить текст/В img2img)."""
+    from bot import scenarios as scn
+    from bot.state import get_state, reset_state_for_tests
+
+    reset_state_for_tests()
+    state = get_state()
+    user = make_user(77)
+    chat = make_chat(77)
+    ctx = make_context()
+
+    # Меню → /brand_generate
+    upd = make_callback_update("menu:brand_generate", user, chat)
+    state_id = await scn.bt2i_start(upd, ctx)
+    assert state_id == scn.BT2I_PROMPT
+    print("  ✓ menu:brand_generate → BT2I_PROMPT")
+
+    # prompt
+    upd = make_message_update("Cloud.ru hero shot, IT specialist on stage", user, chat)
+    state_id = await scn.bt2i_prompt(upd, ctx)
+    assert state_id == scn.BT2I_RATIO
+    print("  ✓ prompt → BT2I_RATIO")
+
+    # ratio
+    upd = make_callback_update("ratio:r_16_9", user, chat)
+    state_id = await scn.bt2i_ratio(upd, ctx)
+    assert state_id == scn.BT2I_RES
+    print("  ✓ ratio:r_16_9 → BT2I_RES")
+
+    # res → enqueue
+    captured: dict = {}
+    with patch("bot.scenarios.PhygitalClient", side_effect=lambda *a, **kw: make_fake_client_cm()), \
+         patch("bot.scenarios.run_brand_text2img", side_effect=make_async_func_mock(captured, name="brand_t2i")), \
+         patch("httpx.AsyncClient", FakeAsyncHttpx):
+        upd = make_callback_update("res:k2", user, chat)
+        state_id = await scn.bt2i_res(upd, ctx)
+        assert state_id == -1
+        await drain_user_queue(state, 77)
+
+    # run_brand_text2img вызван с правильными kwargs
+    assert len(captured["calls"]) == 1
+    kw = captured["calls"][0]["kwargs"]
+    assert kw["prompt"] == "Cloud.ru hero shot, IT specialist on stage"
+    assert kw["model_name"] == "v3_1"
+    assert kw["ratio"] == "r_16_9"
+    assert kw["resolution"] == "k2"
+    print("  ✓ run_brand_text2img(prompt=..., model_name=v3_1, ratio=r_16_9, resolution=k2)")
+
+    # Recipe
+    recipes = list(state.recipes.values())
+    assert len(recipes) == 1
+    rec = recipes[0]
+    assert rec.workflow == "brand_t2i"
+    assert rec.prompt == "Cloud.ru hero shot, IT specialist on stage"
+    print(f"  ✓ recipe.workflow=brand_t2i prompt сохранён")
+
+    # KB: четыре кнопки, включая «Изменить текст» и «В brand img2img»
+    last_call = chat.send_photo.await_args
+    kb = last_call.kwargs["reply_markup"]
+    btns = [b for row in kb.inline_keyboard for b in row]
+    assert any("Повторить" in b.text for b in btns)
+    assert any("Изменить текст" in b.text for b in btns)
+    assert any("В img2img" == b.text for b in btns)
+    assert any("В brand img2img" == b.text for b in btns)
+    print("  ✓ kb: [Повторить/Изменить текст/В img2img/В brand img2img]")
+
+    # Regen — должен ещё раз вызвать run_brand_text2img с тем же prompt
+    captured.clear()
+    with patch("bot.scenarios.PhygitalClient", side_effect=lambda *a, **kw: make_fake_client_cm()), \
+         patch("bot.scenarios.run_brand_text2img", side_effect=make_async_func_mock(captured, name="brand_t2i")), \
+         patch("httpx.AsyncClient", FakeAsyncHttpx):
+        upd = make_callback_update(f"regen:{rec.task_uid}", user, chat)
+        await scn.regen_cb(upd, ctx)
+        await drain_user_queue(state, 77)
+    assert captured["calls"], "regen must re-invoke brand composer"
+    re_kw = captured["calls"][0]["kwargs"]
+    assert re_kw["prompt"] == rec.prompt
+    assert re_kw["ratio"] == "r_16_9"
+    print("  ✓ regen → run_brand_text2img со старым промптом")
+
+
+async def scenario_brand_i2i_flow():
+    """Brand i2i: collect → /done → ratio → res → enqueue. Recipe.workflow='brand_i2i',
+    recipe.prompt='' (нет пользовательского текста), kb БЕЗ кнопки 'Изменить текст'."""
+    from bot import scenarios as scn
+    from bot.state import get_state, reset_state_for_tests
+
+    reset_state_for_tests()
+    state = get_state()
+    user = make_user(88)
+    chat = make_chat(88)
+    ctx = make_context()
+    ctx.bot.get_file = AsyncMock()
+
+    # Подготовим фейковый init-файл в user_tmp (имитируем уже скачанный)
+    user_tmp = state.user_tmp(88)
+    init1 = user_tmp / "init_brand.jpg"
+    init1.write_bytes(b"fake init bytes")
+    ctx.user_data = {"init_paths": [init1], "ratio": "r_3_4", "resolution": "k1"}
+
+    # Пройдём через bi2i_res с готовым стейтом (имитируем после collect/ratio).
+    captured: dict = {}
+    with patch("bot.scenarios.PhygitalClient", side_effect=lambda *a, **kw: make_fake_client_cm()), \
+         patch("bot.scenarios.run_brand_img2img", side_effect=make_async_func_mock(captured, name="brand_i2i")), \
+         patch("httpx.AsyncClient", FakeAsyncHttpx):
+        upd = make_callback_update("res:k1", user, chat)
+        state_id = await scn.bi2i_res(upd, ctx)
+        assert state_id == -1
+        await drain_user_queue(state, 88)
+
+    # run_brand_img2img вызван
+    assert len(captured["calls"]) == 1
+    kw = captured["calls"][0]["kwargs"]
+    assert kw["init_paths"] == [init1]
+    assert kw["model_name"] == "v3_1"
+    assert kw["ratio"] == "r_3_4"
+    assert kw["resolution"] == "k1"
+    print("  ✓ run_brand_img2img(init_paths=..., model_name=v3_1, ratio=r_3_4, resolution=k1)")
+
+    # Recipe
+    recipes = list(state.recipes.values())
+    assert len(recipes) == 1
+    rec = recipes[0]
+    assert rec.workflow == "brand_i2i"
+    assert rec.prompt == "", f"brand_i2i prompt должен быть пустым, got {rec.prompt!r}"
+    assert len(rec.init_paths) == 1 and rec.init_paths[0].exists()
+    # init копия в regen_cache, оригинал удалён
+    assert not init1.exists(), "оригинальный init должен быть удалён через cleanup_paths"
+    print(f"  ✓ recipe.workflow=brand_i2i, prompt='', init в regen_cache")
+
+    # KB: Повторить + В img2img + В brand img2img, БЕЗ «Изменить текст»
+    last_call = chat.send_photo.await_args
+    kb = last_call.kwargs["reply_markup"]
+    btns = [b for row in kb.inline_keyboard for b in row]
+    assert any("Повторить" in b.text for b in btns)
+    assert any("В img2img" == b.text for b in btns)
+    assert any("В brand img2img" == b.text for b in btns)
+    assert not any("Изменить текст" in b.text for b in btns), \
+        "brand_i2i kb не должен содержать «Изменить текст» (нет пользовательского текста)"
+    print("  ✓ kb brand_i2i: [Повторить/В img2img/В brand img2img] (без «Изменить текст»)")
+
+    # Regen — должен ещё раз вызвать run_brand_img2img со скопированными init
+    captured.clear()
+    with patch("bot.scenarios.PhygitalClient", side_effect=lambda *a, **kw: make_fake_client_cm()), \
+         patch("bot.scenarios.run_brand_img2img", side_effect=make_async_func_mock(captured, name="brand_i2i")), \
+         patch("httpx.AsyncClient", FakeAsyncHttpx):
+        upd = make_callback_update(f"regen:{rec.task_uid}", user, chat)
+        await scn.regen_cb(upd, ctx)
+        await drain_user_queue(state, 88)
+    assert captured["calls"], "regen must re-invoke brand_i2i composer"
+    re_kw = captured["calls"][0]["kwargs"]
+    assert len(re_kw["init_paths"]) == 1
+    # _stage_inits_from_recipe должен скопировать init из regen_cache в user_tmp (не использовать
+    # исходник напрямую, чтобы cleanup_paths не зачистил regen_cache).
+    staged = re_kw["init_paths"][0]
+    assert "tmp" in str(staged), f"regen init должен идти из user_tmp, got {staged}"
+    assert "regen_cache" not in str(staged), \
+        f"regen НЕ должен передавать путь напрямую из regen_cache (cleanup его сотрёт): {staged}"
+    print("  ✓ regen brand_i2i → run_brand_img2img со staged-init в user_tmp")
+
+
 async def scenario_i2i_recipe_persists_inits():
     """img2img: init-файлы должны попадать в regen_cache + recipe.init_paths не пустой."""
     from bot import scenarios as scn
@@ -386,14 +569,14 @@ async def scenario_i2i_recipe_persists_inits():
     init1 = user_tmp / "init_test.jpg"
     init1.write_bytes(b"fake init bytes")
 
-    ctx.user_data = {"init_paths": [init1], "prompt": "make it cyber", "node": "nb"}
+    ctx.user_data = {"init_paths": [init1], "prompt": "make it cyber"}
 
     captured: dict = {}
     with patch("bot.scenarios.PhygitalClient", side_effect=lambda *a, **kw: make_fake_client_cm()), \
          patch("bot.scenarios.ImageToImageWorkflow", side_effect=make_workflow_constructor(captured)), \
          patch("httpx.AsyncClient", FakeAsyncHttpx):
-        # Пройдём напрямую через i2i_res (после выбора всех параметров)
-        ctx.user_data.update({"model_name": "v3_1", "ratio": "r_3_4", "resolution": "k1"})
+        # Пройдём напрямую через i2i_res (модель зашита, нода зашита — пикеры сняты)
+        ctx.user_data.update({"ratio": "r_3_4", "resolution": "k1"})
         upd = make_callback_update("res:k1", user, chat)
         state_id = await scn.i2i_res(upd, ctx)
         assert state_id == -1
@@ -430,6 +613,12 @@ async def main():
 
         print("\n━━━ SCENARIO 3: img2img recipe сохраняет init-файлы ━━━")
         await scenario_i2i_recipe_persists_inits()
+
+        print("\n━━━ SCENARIO 4: brand_t2i полный флоу + regen ━━━")
+        await scenario_brand_t2i_flow()
+
+        print("\n━━━ SCENARIO 5: brand_i2i полный флоу + kb без 'Изменить текст' + regen ━━━")
+        await scenario_brand_i2i_flow()
 
     print("\n✅ ALL SCENARIOS PASSED")
 

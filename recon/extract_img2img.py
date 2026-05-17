@@ -119,7 +119,7 @@ def main() -> None:
         "prices_img2img": prices,
     }
     out_path = CAPTURES / "img2img_extract.json"
-    out_path.write_text(json.dumps(out, indent=2, ensure_ascii=False))
+    out_path.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"uploads={len(uploads)}  submits={len(submits)}  configs={len(configs)}  prices={len(prices)}")
     print(f"→ {out_path}")
 

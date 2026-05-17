@@ -4,6 +4,14 @@ pydantic==2.9.2
 pydantic-settings==2.5.2
 python-dotenv==1.0.1
 loguru==0.7.2
+truststore==0.9.2          # системные сертификаты (macOS Keychain / Windows Cert Store / Linux CA bundle)
+
+# Image processing (img2img: HEIC, EXIF, RGBA, 2048-cap)
+Pillow==10.4.0
+pillow-heif==0.18.0
+
+# HAR parsing (recon/extract_img2img.py)
+ijson==3.3.0
 
 # Browser automation (recon + auth bootstrap)
 playwright==1.47.0
