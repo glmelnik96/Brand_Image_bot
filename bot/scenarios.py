@@ -163,18 +163,21 @@ def _kb(
     return InlineKeyboardMarkup(rows)
 
 
+_NO_PROMPT_WORKFLOWS = {"brand_i2i", "speaker"}
+
+
 def _action_keyboard(task_uid: str, *, workflow: str = "nb_t2i") -> InlineKeyboardMarkup:
     """Клавиатура под готовый результат — кнопки повторного использования.
 
     Раскладка:
-      [Повторить] [Изменить текст]                     ← вторая кнопка скрыта для brand_i2i
+      [Повторить] [Изменить текст]                     ← вторая кнопка скрыта для no-prompt сценариев
       [В img2img] [В brand img2img]                    ← два варианта продолжения как img2img
 
-    workflow="brand_i2i" — пользовательского текста нет (промпт фикс. в коде),
-    поэтому кнопку «Изменить текст» скрываем; первая строка остаётся с одной кнопкой.
+    Для сценариев без пользовательского prompt (`brand_i2i`, `speaker` — оба используют
+    зашитый/сгенерированный промпт) кнопку «Изменить текст» скрываем.
     """
     top_row = [InlineKeyboardButton("Повторить", callback_data=f"regen:{task_uid}")]
-    if workflow != "brand_i2i":
+    if workflow not in _NO_PROMPT_WORKFLOWS:
         top_row.append(InlineKeyboardButton("Изменить текст", callback_data=f"editp:{task_uid}"))
     bottom_row = [
         InlineKeyboardButton("В img2img", callback_data=f"asi2i:{task_uid}"),
