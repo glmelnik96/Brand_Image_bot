@@ -30,7 +30,10 @@ WORKFLOW_SCHEMA_ID = 94
 # Промежуточные статусы — продолжаем поллить
 PENDING_STATUSES = {"new", "pending", "running", "queued", "in_progress", "waiting_for_launch"}
 DONE_STATUSES = {"done", "completed", "success"}
-FAIL_STATUSES = {"failed", "error", "canceled", "cancelled"}
+# error_params — терминальный safety/validation reject Phygital'a (position=-1, error_message
+# содержит человекочитаемую причину типа «Please remove potential harmful word ...»). Без него
+# полинг до timeout (600s/180s) держит global_sem и не показывает юзеру причину.
+FAIL_STATUSES = {"failed", "error", "canceled", "cancelled", "error_params"}
 
 
 class ImageGenWorkflow(Workflow):
