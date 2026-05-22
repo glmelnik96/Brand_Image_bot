@@ -19,9 +19,6 @@ playwright==1.47.0
 # Telegram bot
 python-telegram-bot[ext]==21.6
 
-# Storage
-redis==5.0.8
-
 # Optional: anti-fingerprint HTTP client (раскомментируй, если столкнёмся с TLS-fp)
 # curl-cffi==0.7.3
 

@@ -25,7 +25,7 @@ from loguru import logger
 
 from client.api import PhygitalClient
 from client.models import GenerationJob
-from workflows.brand_docs import get_img2img_doc
+from workflows.brand_docs import IMG2IMG_DOC, get_img2img_doc, invalidate_brand_doc
 from workflows.gemini_text import GeminiTextWorkflow
 from workflows.image_to_image import ImageToImageWorkflow
 
@@ -61,6 +61,21 @@ async def run_brand_img2img(
         init_img_dims=dims,
         document_ids=[doc_id],
     )
+    if job_t.status != "completed" and "cannot upload files" in (job_t.error or "").lower():
+        logger.warning(
+            f"[brand_i2i] Phygital reported stale brand doc (was id={doc_id}); "
+            f"invalidating cache and retrying Gemini Text once"
+        )
+        await invalidate_brand_doc(IMG2IMG_DOC)
+        doc_id = await get_img2img_doc(client)
+        logger.info(f"[brand_i2i] retry with fresh doc_id={doc_id}")
+        text_wf = GeminiTextWorkflow(client)
+        job_t = await text_wf.run_text(
+            prompt=BRAND_I2I_PROMPT,
+            init_img_ids=ids,
+            init_img_dims=dims,
+            document_ids=[doc_id],
+        )
     if job_t.status != "completed" or not (job_t.result_text or "").strip():
         logger.warning(
             f"[brand_i2i] Gemini Text failed: status={job_t.status} err={job_t.error!r}"
@@ -79,7 +94,7 @@ async def run_brand_img2img(
     )
     if progress_cb is not None:
         try:
-            await progress_cb("Gemini готов, запускаю Nano Banana…")
+            await progress_cb("Nano Banana")
         except Exception as e:
             logger.debug(f"[brand_i2i] progress_cb failed (non-fatal): {e!r}")
     # img_wf уже держит _init_img_ids/_init_img_dims — build_payload подставит их в init_img.

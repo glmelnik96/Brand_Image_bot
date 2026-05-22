@@ -77,7 +77,7 @@ class TaskRecipe:
       task_uid     — короткий uid задачи (тот же, что в `bot/tmp/<uid>/<task_uid>/`).
       user_id      — кто запускал; нужно для regen_dir и проверок ownership.
       label        — человекочитаемая метка задачи (та же, что в чате).
-      workflow     — тип workflow: 'nb_t2i' | 'nb_i2i' | 'gpt_t2i' | 'gpt_i2i' | 'speaker'.
+      workflow     — тип workflow: 'nb_t2i' | 'nb_i2i' | 'brand_t2i' | 'brand_i2i' | 'speaker'.
       prompt       — финальный промпт (для speaker — собран из speaker_prompt(gender)).
       params       — все параметры пикеров: model/ratio/resolution/quality/aspect/bg/gender.
       init_paths   — пути в regen_cache (копии файлов, переданных в Phygital как init).

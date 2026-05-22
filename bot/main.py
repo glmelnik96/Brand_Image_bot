@@ -3,11 +3,15 @@
 Поддерживает:
 - HTTP-прокси для api.telegram.org (Cloud.ru kwts MITM) + кастомный CA pem.
 - Whitelist по user_id (`TELEGRAM_ALLOWED_USER_IDS`).
-- Три сценария (`/generate`, `/img2img`, `/prep_speaker`) через ConversationHandler.
+- Единое меню (/menu или /start): «Создай / Изменить / Спикер / Помощь»
+  с подменю Photo/Render/2d Isometry для brand text→image.
 - Глобальный лимит одновременных задач + per-user lock (см. bot/state.py).
+- Startup-broadcast с маркером версии: при изменении STARTUP_BROADCAST_TEXT
+  бот один раз шлёт уведомление всем allowed_user_ids, помечает файл в storage/.
 """
 from __future__ import annotations
 
+import hashlib
 import ssl
 import sys
 from pathlib import Path
@@ -28,37 +32,80 @@ from telegram.request import HTTPXRequest
 from bot.auth import whitelist_only
 from bot.scenarios import MENU_KEYBOARD, build_conversations, build_extra_handlers
 from bot.state import MAX_PER_USER_INFLIGHT, USER_QUEUE_LIMIT, get_state
-from client.config import settings
+from client.config import ROOT, settings
 
 
 # ── /start, /help ──────────────────────────────────────────────────────────
 HELP_TEXT = (
     "Phygital+ bot — генерация и редактирование картинок.\n\n"
-    "Базовые сценарии (Nano Banana напрямую):\n"
-    "• /generate — создать картинку по текстовому описанию.\n"
-    "• /img2img — изменить готовые картинки по описанию (1–4 исходника).\n"
-    "• /prep_speaker — обработать фото спикера.\n\n"
-    "Брендовые сценарии (Gemini Text → Nano Banana, +~30 сек):\n"
-    "• /brand_generate — текст → Gemini готовит брендовый промпт под Cloud.ru → картинка.\n"
-    "• /brand_img2img — 1–4 картинки → Gemini сам описывает их по брендовому промпту → новая картинка.\n\n"
-    "Общие команды:\n"
-    "• /menu — главное меню с кнопками.\n"
+    "Управление — только меню (/menu или /start). Слэш-команды-ярлыки сняты,\n"
+    "чтобы один и тот же путь шёл через кнопки.\n\n"
+    "Структура меню:\n"
+    "• Создай изображение\n"
+    "    └ Бренд изображения\n"
+    "         ├ Photo       — фотореалистичный брендовый стиль Cloud.ru\n"
+    "         ├ Render      — 3D-объекты и продуктовые рендеры\n"
+    "         └ 2d Isometry — 2D-изометрические сцены и иллюстрации\n"
+    "    └ Обычное изображение — text→image напрямую в Nano Banana\n"
+    "• Изменить изображение\n"
+    "    ├ Изменить изображение — img2img: исходники + новый текст\n"
+    "    └ Добавить Brand patterns — брендовая обработка картинок (Gemini сам опишет)\n"
+    "• Фотография спикера — портрет спикера по референсу\n"
+    "• Помощь — это сообщение\n\n"
+    "Бренд-сценарии = Gemini Text → Nano Banana (+~30 сек). У каждого Photo/Render/\n"
+    "Isometry свой system-prompt в docs/SYSTEM_PROMPT_Gemini3Pro_CloudRu_*.md.\n\n"
+    "Команды:\n"
+    "• /menu, /start — главное меню.\n"
     "• /cancel — выйти из текущего сценария (или нажать «Отмена» в пикере).\n"
     "• /help — это сообщение.\n\n"
     "Модель: Nano Banana (Gemini Image API), версия 3.1 Pro.\n"
     "Время на одну картинку — ориентировочно 30–60 секунд "
-    "(брендовые сценарии — 60–120 сек, два task'а подряд).\n\n"
-    "Под каждой готовой картинкой появятся кнопки:\n"
-    "• Повторить — заново с теми же параметрами (брендовые сценарии каждый раз "
-    "генерируют новый промпт от Gemini → результат будет другой).\n"
-    "• Изменить текст — поправить описание и перегенерировать; "
-    "бот пришлёт исходный текст в код-блоке для копирования. "
-    "У /brand_img2img этой кнопки нет — там пользовательского текста нет.\n"
-    "• В img2img — использовать эту картинку как исходник для нового запроса.\n"
-    "Кнопки активны 24 часа после получения картинки.\n\n"
+    "(брендовые — 60–120 сек, два task'а подряд).\n\n"
+    "Кнопки под результатом (актуальны 24 часа):\n"
+    "• Повторить — есть в каждом сценарии.\n"
+    "• Изменить текст — только под результатами «Обычное изображение»\n"
+    "  (единственный сценарий с пользовательским текстом).\n"
+    "• Изменить изображение — взять результат как исходник для img2img.\n"
+    "• Добавить Brand patterns — только под результатами «Обычное изображение»;\n"
+    "  отправляет результат в brand-img2img.\n\n"
     f"Лимиты: всего {settings.bot_max_concurrency} задач одновременно, "
     f"на пользователя — до {MAX_PER_USER_INFLIGHT} в работе плюс очередь до {USER_QUEUE_LIMIT}."
 )
+
+
+# Стартовое объявление. Текст хэшируется sha256 → файл-маркер в storage/.
+# Меняешь текст → меняется хэш → бот при следующем запуске разошлёт повторно
+# и положит новый marker-файл. Без смены текста — повторных рассылок нет.
+STARTUP_BROADCAST_TEXT = (
+    "Бот обновлён и снова на связи.\n\n"
+    "Главное меню перестроено — открывается одной командой /menu или /start.\n"
+    "Бренд-генерация теперь делится на три варианта: Photo, Render и 2d Isometry.\n"
+    "Слэш-команды сценариев убраны: всё доступно через кнопки.\n\n"
+    "Если что-то ведёт себя странно — пиши, разберёмся."
+)
+
+
+# Краткая сводка последних фиксов — попадает в DAILY_STARTUP_NOTICE_TEXT.
+# Обновляй здесь при каждом значимом релизе: 1–2 предложения.
+LAST_FIXES_SUMMARY = (
+    "Переписаны промпты «Фотографии спикера» — портрет точнее держит лицо и "
+    "не рисует красную метку из референса. Под готовым портретом появились "
+    "кнопки смены фона на брендовые цвета (зелёный, лайм, фиолетовый, "
+    "голубой, чёрный)."
+)
+
+
+# Ежедневный startup-notice. Шлётся ВСЕГДА при запуске (без sha256-маркера) —
+# в отличие от STARTUP_BROADCAST_TEXT, который рассылается один раз на версию текста.
+DAILY_STARTUP_NOTICE_TEXT = (
+    "Бот вышел на смену и работает до конца рабочего дня.\n"
+    "Если что-то идёт не так — пиши Глебу.\n\n"
+    f"Последние фиксы: {LAST_FIXES_SUMMARY}"
+)
+
+
+# Сообщение при остановке. Шлётся ВСЕГДА (через post_stop-хук PTB).
+SHUTDOWN_NOTICE_TEXT = "Бот ушёл на перерыв. До завтра."
 
 
 @whitelist_only
@@ -178,17 +225,96 @@ async def _post_init(app: Application) -> None:
     await _preflight_session(state)
     await app.bot.set_my_commands(
         [
-            BotCommand("menu", "Главное меню (кнопки)"),
-            BotCommand("generate", "Сгенерировать по тексту"),
-            BotCommand("img2img", "Image→image: картинки + промпт"),
-            BotCommand("brand_generate", "Брендовая картинка по тексту (Cloud.ru)"),
-            BotCommand("brand_img2img", "Брендовая обработка картинок (Cloud.ru)"),
-            BotCommand("prep_speaker", "Обработать фото спикера"),
+            BotCommand("menu", "Главное меню"),
+            BotCommand("start", "Главное меню"),
             BotCommand("cancel", "Отменить текущий сценарий"),
             BotCommand("help", "Справка"),
         ]
     )
     logger.info("Bot commands registered")
+    # Стартовый broadcast (один раз на версию текста). Не валим запуск при ошибках.
+    try:
+        await _startup_broadcast(app)
+    except Exception as e:
+        logger.opt(exception=e).warning(f"startup broadcast crashed: {e!r}")
+    # Ежедневное «бот на смене» — шлётся при каждом запуске, без sha-маркера.
+    try:
+        await _broadcast_to_allowed(app, DAILY_STARTUP_NOTICE_TEXT, tag="daily startup notice")
+    except Exception as e:
+        logger.opt(exception=e).warning(f"daily startup notice crashed: {e!r}")
+
+
+async def _post_stop(app: Application) -> None:
+    """Хук вызывается между Updater.stop() и Application.shutdown() —
+    bot ещё может отправлять сообщения. Шлём «ушёл на перерыв» и не валим
+    остановку при ошибках сети."""
+    try:
+        await _broadcast_to_allowed(app, SHUTDOWN_NOTICE_TEXT, tag="shutdown notice")
+    except Exception as e:
+        logger.opt(exception=e).warning(f"shutdown notice crashed: {e!r}")
+
+
+async def _broadcast_to_allowed(app: Application, text: str, *, tag: str) -> None:
+    """Разослать сообщение всем allowed_user_ids. В отличие от _startup_broadcast
+    не использует sha256-маркер — шлёт всегда. Ошибки по конкретным uid не валят
+    рассылку остальным."""
+    text = text.strip()
+    if not text:
+        return
+    uids = list(settings.allowed_user_ids)
+    if not uids:
+        logger.info(f"{tag}: allowed_user_ids пуст — нечего рассылать")
+        return
+    logger.info(f"{tag}: рассылаю на {len(uids)} uid(ов)")
+    sent = 0
+    for uid in uids:
+        try:
+            await app.bot.send_message(uid, text)
+            sent += 1
+        except Exception as e:
+            logger.warning(f"{tag} → {uid} failed: {type(e).__name__}: {e}")
+    logger.info(f"{tag} done: sent={sent}/{len(uids)}")
+
+
+# storage/startup_broadcast.<digest>.flag — маркер «эту версию текста мы уже разослали».
+_BROADCAST_MARKER_DIR = ROOT / "storage"
+
+
+async def _startup_broadcast(app: Application) -> None:
+    """Разослать STARTUP_BROADCAST_TEXT всем allowed_user_ids один раз на версию текста.
+    Версия = sha256(текст)[:12]. Если файл-маркер с этой версией уже есть — пропускаем."""
+    text = STARTUP_BROADCAST_TEXT.strip()
+    if not text:
+        return
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    marker = _BROADCAST_MARKER_DIR / f"startup_broadcast.{digest}.flag"
+    if marker.exists():
+        logger.info(f"startup broadcast: marker {marker.name} exists — skip")
+        return
+    uids = list(settings.allowed_user_ids)
+    if not uids:
+        logger.info("startup broadcast: allowed_user_ids пуст — нечего рассылать")
+        return
+    logger.info(f"startup broadcast: рассылаю версию {digest} на {len(uids)} uid(ов)")
+    sent: list[int] = []
+    failed: list[tuple[int, str]] = []
+    for uid in uids:
+        try:
+            await app.bot.send_message(uid, text)
+            sent.append(uid)
+        except Exception as e:
+            failed.append((uid, f"{type(e).__name__}: {e}"))
+            logger.warning(f"startup broadcast → {uid} failed: {type(e).__name__}: {e}")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(
+        f"version={digest}\nsent={len(sent)}/{len(uids)}\n"
+        f"sent_uids={sent}\nfailed={failed}\n",
+        encoding="utf-8",
+    )
+    logger.info(
+        f"startup broadcast done: sent={len(sent)}/{len(uids)}, "
+        f"marker={marker.name}"
+    )
 
 
 async def _preflight_session(state) -> None:
@@ -237,6 +363,7 @@ def build_app() -> Application:
     if poll_req is not None:
         builder = builder.get_updates_request(poll_req)
     builder = builder.post_init(_post_init)
+    builder = builder.post_stop(_post_stop)
     app = builder.build()
 
     # Group=-1: лог всех апдейтов до того, как их разберут conversations.

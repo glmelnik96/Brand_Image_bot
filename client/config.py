@@ -22,7 +22,6 @@ class Settings(BaseSettings):
     telegram_proxy_cert: str = ""  # path к PEM CA прокси; пусто = truststore (keychain)
     bot_max_concurrency: int = 5
 
-    redis_url: str = "redis://localhost:6379/0"
     session_file: Path = ROOT / "storage" / "session.json"
 
     log_level: str = "INFO"

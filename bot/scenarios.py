@@ -60,6 +60,7 @@ from telegram.ext import (
 
 from bot.auth import whitelist_only
 from bot.state import USER_QUEUE_LIMIT, TaskRecipe, get_state
+from bot.status_reporter import StatusReporter
 from client.api import _SSL_CTX, PhygitalClient
 from client.models import GenerationJob
 from workflows.brand_img2img import run_brand_img2img
@@ -67,7 +68,9 @@ from workflows.brand_text2img import run_brand_text2img
 from workflows.image_gen import ImageGenWorkflow
 from workflows.image_to_image import ImageToImageWorkflow
 from workflows.speaker_prep import (
+    BG_COLORS,
     DEFAULT_REFERENCE,
+    bg_swap_prompt,
     build_speaker_prep_workflow,
     speaker_prompt,
 )
@@ -163,37 +166,94 @@ def _kb(
     return InlineKeyboardMarkup(rows)
 
 
-_NO_PROMPT_WORKFLOWS = {"brand_i2i", "speaker"}
-
-
 def _action_keyboard(task_uid: str, *, workflow: str = "nb_t2i") -> InlineKeyboardMarkup:
     """Клавиатура под готовый результат — кнопки повторного использования.
 
-    Раскладка:
-      [Повторить] [Изменить текст]                     ← вторая кнопка скрыта для no-prompt сценариев
-      [В img2img] [В brand img2img]                    ← два варианта продолжения как img2img
+    Раскладка зависит от сценария:
+      - nb_t2i (обычная T2I): [Повторить] [Изменить текст]
+                              [Изменить изображение] [Добавить Brand patterns]
+      - brand_t2i (Photo/Render/Isometry): [Повторить] [Изменить изображение]
+      - speaker / speaker_bg: [Повторить] + строка кнопок «Сменить фон: <цвет>»
+      - все остальные (nb_i2i, brand_i2i): [Повторить]
 
-    Для сценариев без пользовательского prompt (`brand_i2i`, `speaker` — оба используют
-    зашитый/сгенерированный промпт) кнопку «Изменить текст» скрываем.
+    «Изменить текст» оставлена ТОЛЬКО на обычной T2I — единственный сценарий,
+    где у пользователя есть собственный текстовый промпт, который имеет смысл
+    править между запусками. Brand-сценарии гонят промпт через Gemini Text,
+    img2img/speaker — без пользовательского текста.
+
+    Колбэки `asi2i:` («Изменить изображение») и `asbi2i:` («Добавить Brand
+    patterns») остались прежними — лишь переименованы лейблы.
+    spkrbg:<task_uid>:<HEX> — смена фона на однотонный (см. speaker_bg_cb).
     """
-    top_row = [InlineKeyboardButton("Повторить", callback_data=f"regen:{task_uid}")]
-    if workflow not in _NO_PROMPT_WORKFLOWS:
-        top_row.append(InlineKeyboardButton("Изменить текст", callback_data=f"editp:{task_uid}"))
-    bottom_row = [
-        InlineKeyboardButton("В img2img", callback_data=f"asi2i:{task_uid}"),
-        InlineKeyboardButton("В brand img2img", callback_data=f"asbi2i:{task_uid}"),
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton("Повторить", callback_data=f"regen:{task_uid}")]
     ]
-    return InlineKeyboardMarkup([top_row, bottom_row])
+    if workflow == "nb_t2i":
+        rows.append([InlineKeyboardButton("Изменить текст", callback_data=f"editp:{task_uid}")])
+        rows.append([
+            InlineKeyboardButton("Изменить изображение", callback_data=f"asi2i:{task_uid}"),
+            InlineKeyboardButton("Добавить Brand patterns", callback_data=f"asbi2i:{task_uid}"),
+        ])
+    elif workflow == "brand_t2i":
+        rows.append([
+            InlineKeyboardButton("Изменить изображение", callback_data=f"asi2i:{task_uid}"),
+        ])
+    elif workflow in ("speaker", "speaker_bg"):
+        # 5 brand-цветов под результатом портрета: разбиваем 3+2 чтобы метки помещались.
+        color_btns = [
+            InlineKeyboardButton(name, callback_data=f"spkrbg:{task_uid}:{hex_code}")
+            for hex_code, name in BG_COLORS
+        ]
+        rows.append(color_btns[:3])
+        if color_btns[3:]:
+            rows.append(color_btns[3:])
+    # nb_i2i / brand_i2i — только «Повторить»
+    return InlineKeyboardMarkup(rows)
 
 
-MENU_KEYBOARD = InlineKeyboardMarkup([
-    [InlineKeyboardButton("Брендовая картинка по тексту", callback_data="menu:brand_generate")],
-    [InlineKeyboardButton("Брендовая обработка картинки", callback_data="menu:brand_img2img")],
-    [InlineKeyboardButton("Создать картинку по тексту", callback_data="menu:generate")],
-    [InlineKeyboardButton("Изменить картинки по тексту", callback_data="menu:img2img")],
-    [InlineKeyboardButton("Обработать фото спикера", callback_data="menu:prep_speaker")],
-    [InlineKeyboardButton("Помощь", callback_data="menu:help")],
-])
+# ── главное меню и подменю ─────────────────────────────────────────────────
+# Иерархия:
+#   root → make → make_brand → {photo, render, isometric}
+#                └ generate (обычное text→image)
+#        → edit → {img2img, brand_img2img}
+#        → prep_speaker
+#        → help
+def _menu_root_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Создай изображение", callback_data="menu:make")],
+        [InlineKeyboardButton("Изменить изображение", callback_data="menu:edit")],
+        [InlineKeyboardButton("Фотография спикера", callback_data="menu:prep_speaker")],
+        [InlineKeyboardButton("Помощь", callback_data="menu:help")],
+    ])
+
+
+def _menu_make_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Бренд изображения", callback_data="menu:make_brand")],
+        [InlineKeyboardButton("Обычное изображение", callback_data="menu:generate")],
+        [InlineKeyboardButton("Назад", callback_data="menu:root")],
+    ])
+
+
+def _menu_make_brand_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Photo", callback_data="menu:brand_photo")],
+        [InlineKeyboardButton("Render", callback_data="menu:brand_render")],
+        [InlineKeyboardButton("2d Isometry", callback_data="menu:brand_isometric")],
+        [InlineKeyboardButton("Назад", callback_data="menu:make")],
+    ])
+
+
+def _menu_edit_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Изменить изображение", callback_data="menu:img2img")],
+        [InlineKeyboardButton("Добавить Brand patterns", callback_data="menu:brand_img2img")],
+        [InlineKeyboardButton("Назад", callback_data="menu:root")],
+    ])
+
+
+# Алиас для совместимости с импортом из bot/main.py (cmd_start).
+MENU_KEYBOARD = _menu_root_kb()
 
 
 async def _edit_picked(q, title: str, value_label: str) -> None:
@@ -245,6 +305,24 @@ async def _check_user_capacity(update: Update) -> bool:
     return True
 
 
+# Маппинг workflow → имя первого этапа для StatusReporter.
+# Brand-сценарии стартуют с Gemini Text, остальные — сразу с Nano Banana.
+_FIRST_STEP_BY_WORKFLOW: dict[str, str] = {
+    "nb_t2i": "Nano Banana",
+    "nb_i2i": "Nano Banana",
+    "brand_t2i": "Gemini Text",
+    "brand_i2i": "Gemini Text",
+    "speaker": "Nano Banana",
+    "speaker_bg": "Nano Banana",
+}
+
+
+def _initial_step_for(recipe_template: TaskRecipe | None) -> str:
+    if recipe_template is None:
+        return "Генерация"
+    return _FIRST_STEP_BY_WORKFLOW.get(recipe_template.workflow, "Генерация")
+
+
 # ── enqueue: вызывается из финального хэндлера пикера ─────────────────────
 async def _enqueue_task(
     *,
@@ -266,7 +344,6 @@ async def _enqueue_task(
     """
     state = get_state()
     log = logger.bind(uid=uid, uname=uname, label=label)
-    eta_hint = f" (обычно {_fmt_eta(eta_sec)})" if eta_sec else ""
 
     inflight, queued = state.user_load(uid)
     total_after = inflight + queued + 1
@@ -279,9 +356,16 @@ async def _enqueue_task(
         return
 
     queue_pos = inflight + queued + 1  # 1-based «эта задача — N-я твоя в полёте»
+    # Начальный текст. StatusReporter перерисует его, как только дошли до _execute_task.
+    eta_hint = f" • ожидаемое время {_fmt_eta(eta_sec)}" if eta_sec else ""
     status: Message = await chat.send_message(
-        f"Принято: {label}. Это твоя задача №{queue_pos}{eta_hint}."
+        f"{label} — принято\nочередь №{queue_pos}{eta_hint}"
     )
+    reporter = StatusReporter(status=status, label=label, eta_sec=eta_sec)
+    # Не дожидаемся отправки initial-сообщения (оно уже ушло), но синхронизуем внутреннее
+    # состояние reporter'а — на случай если queue_pos > 1 и юзер успеет увидеть «в очереди».
+    await reporter.queued(queue_pos=queue_pos)
+
     queued_at = time.monotonic()
     task_uid = uuid.uuid4().hex[:8]
 
@@ -289,7 +373,7 @@ async def _enqueue_task(
         await _execute_task(
             ctx=ctx, uid=uid, uname=uname, chat=chat,
             runner=runner, label=label, eta_sec=eta_sec,
-            status=status, queued_at=queued_at, task_uid=task_uid,
+            reporter=reporter, queued_at=queued_at, task_uid=task_uid,
             cleanup_paths=cleanup_paths or [],
             recipe_template=recipe_template,
         )
@@ -298,9 +382,7 @@ async def _enqueue_task(
     if not accepted:
         # Между user_load и submit_task проскочила другая задача — отбиваемся.
         log.warning("rejected at submit: queue full race")
-        await status.edit_text(
-            "Очередь заполнилась прямо сейчас. Попробуй ещё раз."
-        )
+        await reporter.error("Очередь заполнилась прямо сейчас. Попробуй ещё раз.")
         return
     log.info(f"enqueued (queue_pos={queue_pos}, inflight={inflight}, queued={queued})")
 
@@ -314,7 +396,7 @@ async def _execute_task(
     runner: Callable[[], Awaitable[GenerationJob]],
     label: str,
     eta_sec: int | None,
-    status: Message,
+    reporter: StatusReporter,
     queued_at: float,
     task_uid: str,
     cleanup_paths: list[Path],
@@ -324,32 +406,19 @@ async def _execute_task(
     На успехе сохраняет recipe + первую result-картинку в regen_cache для пост-задачных кнопок."""
     state = get_state()
     log = logger.bind(uid=uid, uname=uname, label=label, task=task_uid)
-    eta_hint = f" (обычно {_fmt_eta(eta_sec)})" if eta_sec else ""
 
-    try:
-        await status.edit_text(f"В очереди: {label}{eta_hint}.")
-    except Exception:
-        pass
+    # Сразу показываем «жду слот» — ticker побежит даже до global_sem.
+    await reporter.waiting_slot()
 
     try:
         async with state.global_sem:
             queue_wait = time.monotonic() - queued_at
             log.info(f"started (queue_wait={queue_wait:.1f}s)")
-            try:
-                await status.edit_text(f"Генерирую: {label}{eta_hint}…")
-            except Exception:
-                pass
+            first_step = _initial_step_for(recipe_template)
+            await reporter.start(first_step)
             run_started = time.monotonic()
 
-            async def progress(msg: str) -> None:
-                """Промежуточный статус (например, между Gemini Text и Nano Banana
-                в brand-цепочках). Не валим задачу, если edit_text не прошёл."""
-                try:
-                    await status.edit_text(f"{label}{eta_hint}: {msg}")
-                except Exception as e:
-                    log.debug(f"progress edit_text failed (non-fatal): {e!r}")
-
-            job = await runner(progress_cb=progress)
+            job = await runner(progress_cb=reporter.step)
             gen_dur = time.monotonic() - run_started
 
         log = log.bind(job_id=job.job_id)
@@ -358,9 +427,7 @@ async def _execute_task(
         )
 
         if job.status == "completed" and job.result_urls:
-            await status.edit_text(
-                f"Готово за {gen_dur:.0f} сек: {label} (job_id={job.job_id})."
-            )
+            await reporter.done(job_id=str(job.job_id))
             # Скачиваем + отправляем каждую картинку; ловим путь к первой для regen-cache.
             first_result_local: Path | None = None
             workflow_for_kb = recipe_template.workflow if recipe_template else "nb_t2i"
@@ -386,20 +453,13 @@ async def _execute_task(
                     log.opt(exception=e).warning(f"recipe save failed: {e!r}")
         elif job.status == "completed":
             log.error("completed but result_urls is empty")
-            await status.edit_text(
-                f"Ошибка ({label}): задача завершилась, но Phygital не вернул ссылки на файлы."
-            )
+            await reporter.error("задача завершилась, но Phygital не вернул ссылки на файлы")
         else:
             log.warning(f"job not completed: {job.status} err={job.error!r}")
-            await status.edit_text(
-                f"Ошибка ({label}): {job.status}\n{job.error or '—'}"
-            )
+            await reporter.error(job.error or job.status)
     except Exception as e:
         log.opt(exception=e).error(f"task crashed: {type(e).__name__}: {e}")
-        try:
-            await status.edit_text(f"Ошибка ({label}): {type(e).__name__}: {e}")
-        except Exception as e2:
-            log.warning(f"could not edit status message: {e2!r}")
+        await reporter.crashed(f"{type(e).__name__}: {e}")
     finally:
         # Чистим только эти init-файлы (они уже не нужны: ушли в Phygital + скопированы в regen_cache).
         for p in cleanup_paths:
@@ -560,26 +620,14 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def gen_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not await _check_user_capacity(update):
         return ConversationHandler.END
-    log = _ulog(update, "/generate")
-    # Если зашли через menu-callback — подтверждаем нажатие.
+    log = _ulog(update, "generate")
+    # Вход только через menu-callback — подтверждаем нажатие.
     if update.callback_query:
         try:
             await update.callback_query.answer()
         except Exception:
             pass
     target = _first_message(update)
-    # `/generate <prompt>` поддерживается только когда вход через CommandHandler.
-    args = (ctx.args or []) if update.message else []
-    if args:
-        prompt = " ".join(args).strip()
-        ctx.user_data["prompt"] = prompt
-        log.info(f"inline args: prompt_chars={len(prompt)} — asking for ratio")
-        await target.reply_text(
-            "Описание принято. Теперь выбери соотношение сторон. "
-            "Кнопка «auto» — модель подберёт сама.",
-            reply_markup=_kb("ratio", GEMINI_RATIOS, cols=4),
-        )
-        return GEN_RATIO
     log.info("entered prompt-collection state")
     await target.reply_text(
         "Опиши текстом, что нужно нарисовать. /cancel — выйти."
@@ -820,7 +868,13 @@ async def sp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data["speaker_photo"] = None
     target = _first_message(update)
     await target.reply_text(
-        "Пришли фото спикера (одно фото или файл-изображение). /cancel — отменить."
+        "Пришли фото спикера — одним фото или файлом-изображением.\n\n"
+        "Чтобы результат получился чистым, лучше заранее обрезать кадр так, "
+        "чтобы в нём остался только сам человек: без фона мероприятия, "
+        "посторонних людей и подписей.\n\n"
+        "Если итоговый портрет получится неудачно — просто запусти сценарий ещё раз: "
+        "Nano Banana каждый раз генерирует чуть иной вариант.\n\n"
+        "/cancel — отменить."
     )
     return SP_PHOTO
 
@@ -930,35 +984,46 @@ async def sp_res(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-# ── /brand_generate ────────────────────────────────────────────────────────
-# Brand-консистентный text→image: user text → Gemini Text (CloudRu Enhancer) → Nano Banana.
+# ── brand text→image (Photo / Render / 2d Isometry) ───────────────────────
+# Brand-консистентный text→image: user text → Gemini Text (variant system-prompt) → Nano Banana.
+# Вариант определяется callback_data входной menu-кнопки:
+#   menu:brand_photo     → variant="photo"
+#   menu:brand_render    → variant="render"
+#   menu:brand_isometric → variant="isometric"
+_BRAND_VARIANT_BY_CALLBACK = {
+    "menu:brand_photo": "photo",
+    "menu:brand_render": "render",
+    "menu:brand_isometric": "isometric",
+}
+_BRAND_VARIANT_LABEL = {
+    "photo": "Photo",
+    "render": "Render",
+    "isometric": "2d Isometry",
+}
+
+
 @whitelist_only
 async def bt2i_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not await _check_user_capacity(update):
         return ConversationHandler.END
-    log = _ulog(update, "/brand_generate")
+    log = _ulog(update, "brand_generate")
+    variant = "photo"  # дефолт на случай если попали сюда не через callback
     if update.callback_query:
         try:
             await update.callback_query.answer()
         except Exception:
             pass
-    target = _first_message(update)
-    args = (ctx.args or []) if update.message else []
-    if args:
-        prompt = " ".join(args).strip()
-        ctx.user_data["prompt"] = prompt
-        log.info(f"inline args: prompt_chars={len(prompt)} — asking for ratio")
-        await target.reply_text(
-            "Описание принято. Между текстом и Nano Banana встанет Gemini Text "
-            "(брендовый промпт Cloud.ru), это добавит ~30 сек к генерации.\n"
-            "Теперь выбери соотношение сторон.",
-            reply_markup=_kb("ratio", GEMINI_RATIOS, cols=4),
+        variant = _BRAND_VARIANT_BY_CALLBACK.get(
+            update.callback_query.data, "photo"
         )
-        return BT2I_RATIO
-    log.info("entered prompt-collection state")
+    ctx.user_data["variant"] = variant
+    log.info(f"entered prompt-collection state (variant={variant})")
+    target = _first_message(update)
     await target.reply_text(
+        f"Бренд-вариант: <b>{_BRAND_VARIANT_LABEL[variant]}</b>.\n"
         "Опиши идею картинки в свободной форме. Gemini подготовит брендовый "
-        "промпт под Cloud.ru, потом Nano Banana нарисует. /cancel — выйти."
+        "промпт под Cloud.ru, потом Nano Banana нарисует. /cancel — выйти.",
+        parse_mode="HTML",
     )
     return BT2I_PROMPT
 
@@ -1013,6 +1078,7 @@ async def bt2i_res(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def _bt2i_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     prompt: str = ctx.user_data["prompt"]
+    variant: str = ctx.user_data.get("variant", "photo")
     model = NANO_BANANA_MODEL
     ratio = ctx.user_data.get("ratio", "default")
     resolution = ctx.user_data.get("resolution", "default")
@@ -1023,15 +1089,19 @@ async def _bt2i_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     async def runner(progress_cb=None) -> GenerationJob:
         async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
             return await run_brand_text2img(
-                client, prompt=prompt, model_name=model, ratio=ratio, resolution=resolution,
-                progress_cb=progress_cb,
+                client, prompt=prompt, variant=variant, model_name=model,
+                ratio=ratio, resolution=resolution, progress_cb=progress_cb,
             )
 
+    label = f"brand_t2i:{variant}/{model}/{ratio}/{resolution}"
     template = TaskRecipe(
         task_uid="", user_id=u.id,
-        label=f"brand_t2i/{model}/{ratio}/{resolution}",
+        label=label,
         workflow="brand_t2i", prompt=prompt,
-        params={"model": model, "ratio": ratio, "resolution": resolution},
+        params={
+            "model": model, "ratio": ratio, "resolution": resolution,
+            "variant": variant,
+        },
     )
     await _enqueue_task(
         ctx=ctx,
@@ -1039,7 +1109,7 @@ async def _bt2i_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         uname=u.username or u.full_name or "?",
         chat=chat,
         runner=runner,
-        label=f"brand_t2i/{model}/{ratio}/{resolution}",
+        label=label,
         eta_sec=ETA_BRAND_SEC,
         recipe_template=template,
     )
@@ -1218,13 +1288,38 @@ async def cmd_menu(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 @whitelist_only
 async def menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Роутер callback-кнопок главного меню. menu:help отрабатываем сами.
-    menu:generate/img2img/prep_speaker отрабатываются как entry_points соответствующих
-    ConversationHandler — этот хендлер для них не вызывается."""
+    """Роутер callback-кнопок главного меню: переключает подменю «на месте» (edit_message)
+    и показывает help. Entry-кнопки сценариев (menu:generate, menu:img2img,
+    menu:brand_img2img, menu:brand_photo|render|isometric, menu:prep_speaker)
+    разбираются ConversationHandler-ами и сюда не доходят."""
     q = update.callback_query
     action = q.data.split(":", 1)[1]
     await q.answer()
-    if action == "help":
+    if action == "root":
+        await q.edit_message_text(
+            "Главное меню. Выбери, что сделать:",
+            reply_markup=_menu_root_kb(),
+        )
+    elif action == "make":
+        await q.edit_message_text(
+            "Создать новое изображение:",
+            reply_markup=_menu_make_kb(),
+        )
+    elif action == "make_brand":
+        await q.edit_message_text(
+            "Бренд-вариант для Cloud.ru. У каждого свой Gemini system-prompt:\n"
+            "• <b>Photo</b> — фотореализм, люди и сцены.\n"
+            "• <b>Render</b> — 3D-объекты и продуктовые рендеры.\n"
+            "• <b>2d Isometry</b> — 2D-изометрические сцены и иллюстрации.",
+            reply_markup=_menu_make_brand_kb(),
+            parse_mode="HTML",
+        )
+    elif action == "edit":
+        await q.edit_message_text(
+            "Изменить существующее изображение:",
+            reply_markup=_menu_edit_kb(),
+        )
+    elif action == "help":
         # Импорт из main избежим, текст всё равно дублируется в /help-хендлере.
         from bot.main import HELP_TEXT  # noqa: WPS433  локальный импорт чтобы не цикл
         await q.message.reply_text(HELP_TEXT)
@@ -1382,6 +1477,95 @@ async def as_brand_i2i_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     return BI2I_COLLECT
 
 
+# ── смена фона у портрета спикера ─────────────────────────────────────────
+# spkrbg:<task_uid>:<HEX> — берём result_path исходного prep_speaker (или
+# предыдущего speaker_bg) и шлём в Nano Banana как одну init-картинку с
+# фикс. промптом «замени фон на сплошной #HEX». Соотношение/разрешение
+# наследуем у исходной задачи. Новый recipe.workflow = "speaker_bg" — чтобы
+# под результатом снова появились те же 5 цветовых кнопок.
+_BG_NAME_BY_HEX: dict[str, str] = {h: name for h, name in BG_COLORS}
+
+
+@whitelist_only
+async def speaker_bg_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    parts = (q.data or "").split(":")
+    if len(parts) != 3:
+        await q.answer("Неверный формат кнопки.")
+        return
+    _, task_uid, hex_code = parts
+    hex_code = hex_code.upper()
+    color_name = _BG_NAME_BY_HEX.get(hex_code)
+    if color_name is None:
+        await q.answer("Неизвестный цвет.")
+        return
+
+    state = get_state()
+    recipe = state.get_recipe(task_uid)
+    if recipe is None or recipe.result_path is None or not recipe.result_path.exists():
+        await q.answer("Картинка устарела или не сохранилась локально.")
+        return
+    if not await _check_user_capacity_cb(update):
+        await q.answer()
+        return
+    await q.answer(f"Меняю фон на {color_name} (#{hex_code}).")
+
+    u = update.effective_user
+    chat = update.effective_chat
+    uid = u.id
+    # Копируем исходник в свежий tmp — _execute_task потом удалит его через cleanup_paths.
+    user_tmp = state.user_tmp(uid)
+    suffix = recipe.result_path.suffix or ".png"
+    src_copy = user_tmp / f"spkrbg_{int(time.time() * 1000)}{suffix}"
+    try:
+        shutil.copyfile(recipe.result_path, src_copy)
+    except Exception as e:
+        _ulog(update, "spkrbg").warning(f"copy src failed: {e!r}")
+        await chat.send_message("Не смог подготовить картинку. Попробуй ещё раз.")
+        return
+
+    prompt = bg_swap_prompt(hex_code, color_name)
+    # Наследуем ratio/resolution от исходной задачи — иначе Nano Banana может
+    # отдать другой кроп. Дефолты — те же, что у prep_speaker.
+    ratio = recipe.params.get("ratio", "r_3_4")
+    resolution = recipe.params.get("resolution", "k2")
+    model = NANO_BANANA_MODEL
+    _ulog(update, "spkrbg").info(
+        f"from task={task_uid} → hex={hex_code} name={color_name} "
+        f"ratio={ratio} res={resolution}"
+    )
+
+    async def runner(progress_cb=None) -> GenerationJob:
+        async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
+            wf = ImageToImageWorkflow(
+                client, model_name=model, ratio=ratio, resolution=resolution
+            )
+            return await wf.run_with_files(prompt=prompt, init_paths=[src_copy])
+
+    template = TaskRecipe(
+        task_uid="", user_id=uid,
+        label=f"speaker-bg/{hex_code}/{ratio}/{resolution}",
+        workflow="speaker_bg", prompt=prompt,
+        params={
+            "hex": hex_code, "color_name": color_name,
+            "ratio": ratio, "resolution": resolution,
+            # сохраняем исходник для повторов: см. _rerun_from_recipe (speaker_bg)
+            "source_task_uid": task_uid,
+        },
+    )
+    await _enqueue_task(
+        ctx=ctx,
+        uid=uid,
+        uname=u.username or u.full_name or "?",
+        chat=chat,
+        runner=runner,
+        label=f"speaker-bg/{color_name}",
+        eta_sec=ETA_NANO_BANANA_SEC,
+        cleanup_paths=[src_copy],
+        recipe_template=template,
+    )
+
+
 # ── _rerun_from_recipe ─────────────────────────────────────────────────────
 async def _rerun_from_recipe(
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -1438,16 +1622,17 @@ async def _rerun_from_recipe(
         model = NANO_BANANA_MODEL
         ratio = params.get("ratio", "default")
         resolution = params.get("resolution", "default")
+        variant = params.get("variant", "photo")
 
         async def runner(progress_cb=None) -> GenerationJob:
             async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
                 return await run_brand_text2img(
-                    client, prompt=prompt, model_name=model,
+                    client, prompt=prompt, variant=variant, model_name=model,
                     ratio=ratio, resolution=resolution,
                     progress_cb=progress_cb,
                 )
 
-        label = f"brand_t2i/{model}/{ratio}/{resolution}"
+        label = f"brand_t2i:{variant}/{model}/{ratio}/{resolution}"
         eta = ETA_BRAND_SEC
         cleanup = []
         new_workflow = "brand_t2i"
@@ -1503,6 +1688,30 @@ async def _rerun_from_recipe(
         cleanup = [speaker_photo]
         new_workflow = "speaker"
 
+    elif recipe.workflow == "speaker_bg":
+        # Повторяем смену фона: тот же исходник из recipe.init_paths,
+        # тот же prompt (с тем же hex) — Nano Banana отдаст новый вариант.
+        model = NANO_BANANA_MODEL
+        ratio = params.get("ratio", "r_3_4")
+        resolution = params.get("resolution", "k2")
+        init_paths = _stage_inits_from_recipe(state, u.id, recipe)
+        if not init_paths:
+            await chat.send_message("Не нашёл локальной копии исходника для повтора.")
+            return
+
+        async def runner(progress_cb=None) -> GenerationJob:
+            async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
+                wf = ImageToImageWorkflow(
+                    client, model_name=model, ratio=ratio, resolution=resolution
+                )
+                return await wf.run_with_files(prompt=prompt, init_paths=init_paths)
+
+        color_name = params.get("color_name", "bg")
+        label = f"speaker-bg/{color_name}"
+        eta = ETA_NANO_BANANA_SEC
+        cleanup = list(init_paths)
+        new_workflow = "speaker_bg"
+
     else:
         await chat.send_message(
             f"Не знаю, как повторить этот тип задачи (workflow={recipe.workflow})."
@@ -1547,10 +1756,12 @@ def _stage_inits_from_recipe(state, uid: int, recipe: TaskRecipe) -> list[Path]:
 
 # ── фабрика для регистрации в Application ──────────────────────────────────
 def build_conversations() -> list[ConversationHandler]:
-    """Три ConversationHandler — /generate, /img2img, /prep_speaker.
-    Каждый entry-point дублируется: CommandHandler + CallbackQueryHandler для menu-кнопки.
-    Img2img дополнительно слушает `asi2i:*` (Use as img2img на готовом результате).
-    Fallbacks включают inline-Cancel (callback `cancel:*`) и /cancel."""
+    """Пять ConversationHandler по числу сценариев:
+      - generate / img2img / prep_speaker / brand_i2i — entry только из меню.
+      - brand_t2i — entry из меню по трём вариантам (photo/render/isometric).
+    Img2img дополнительно слушает `asi2i:*` (Изменить изображение на результате),
+    brand_i2i — `asbi2i:*` (Добавить Brand patterns на результате).
+    Fallbacks: inline-Cancel (callback `cancel:*`) и /cancel."""
     img_filter = filters.PHOTO | (filters.Document.IMAGE)
     cancel_handlers = [
         CommandHandler("cancel", cmd_cancel),
@@ -1559,7 +1770,6 @@ def build_conversations() -> list[ConversationHandler]:
 
     conv_generate = ConversationHandler(
         entry_points=[
-            CommandHandler("generate", gen_start),
             CallbackQueryHandler(gen_start, pattern=r"^menu:generate$"),
         ],
         states={
@@ -1574,7 +1784,6 @@ def build_conversations() -> list[ConversationHandler]:
 
     conv_img2img = ConversationHandler(
         entry_points=[
-            CommandHandler("img2img", i2i_start),
             CallbackQueryHandler(i2i_start, pattern=r"^menu:img2img$"),
             CallbackQueryHandler(as_i2i_cb, pattern=r"^asi2i:"),
         ],
@@ -1594,7 +1803,6 @@ def build_conversations() -> list[ConversationHandler]:
 
     conv_prep = ConversationHandler(
         entry_points=[
-            CommandHandler("prep_speaker", sp_start),
             CallbackQueryHandler(sp_start, pattern=r"^menu:prep_speaker$"),
         ],
         states={
@@ -1610,8 +1818,10 @@ def build_conversations() -> list[ConversationHandler]:
 
     conv_brand_t2i = ConversationHandler(
         entry_points=[
-            CommandHandler("brand_generate", bt2i_start),
-            CallbackQueryHandler(bt2i_start, pattern=r"^menu:brand_generate$"),
+            CallbackQueryHandler(
+                bt2i_start,
+                pattern=r"^menu:brand_(photo|render|isometric)$",
+            ),
         ],
         states={
             BT2I_PROMPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, bt2i_prompt)],
@@ -1625,7 +1835,6 @@ def build_conversations() -> list[ConversationHandler]:
 
     conv_brand_i2i = ConversationHandler(
         entry_points=[
-            CommandHandler("brand_img2img", bi2i_start),
             CallbackQueryHandler(bi2i_start, pattern=r"^menu:brand_img2img$"),
             CallbackQueryHandler(as_brand_i2i_cb, pattern=r"^asbi2i:"),
         ],
@@ -1647,17 +1856,24 @@ def build_conversations() -> list[ConversationHandler]:
 
 def build_extra_handlers() -> list:
     """Стандалон-хендлеры, регистрируются после ConversationHandler:
-      - /menu — открыть главное меню
-      - menu_router — обрабатывает menu:help (menu:generate/img2img/prep_speaker уходят в conv-ы)
-      - regen_cb / edit_prompt_cb — на инлайн-кнопках готового результата
-      - pending_edit_listener — глобальный MessageHandler в group=1, чтобы НЕ перехватывать
-        текст активной conversation (она в group=0 заберёт первой).
+      - /menu — открыть главное меню (одна команда для всех сценариев).
+      - menu_router — навигация корень/подменю + show help. Entry-кнопки
+        сценариев (menu:generate, menu:img2img, menu:brand_img2img,
+        menu:brand_{photo,render,isometric}, menu:prep_speaker) сюда не доходят —
+        их забирают ConversationHandler.
+      - regen_cb / edit_prompt_cb — на инлайн-кнопках готового результата.
+      - pending_edit_listener — глобальный MessageHandler в group=1, чтобы НЕ
+        перехватывать текст активной conversation (она в group=0 заберёт первой).
     """
     return [
         ("group0", CommandHandler("menu", cmd_menu)),
-        ("group0", CallbackQueryHandler(menu_router, pattern=r"^menu:help$")),
+        # Точный список callback'ов навигации — не должен пересекаться с entry-точками conv'ов.
+        ("group0", CallbackQueryHandler(
+            menu_router, pattern=r"^menu:(root|make|make_brand|edit|help)$"
+        )),
         ("group0", CallbackQueryHandler(regen_cb, pattern=r"^regen:")),
         ("group0", CallbackQueryHandler(edit_prompt_cb, pattern=r"^editp:")),
+        ("group0", CallbackQueryHandler(speaker_bg_cb, pattern=r"^spkrbg:")),
         # Глобальный listener в group=1 — после conversations.
         ("group1", MessageHandler(filters.TEXT & ~filters.COMMAND, pending_edit_listener)),
     ]

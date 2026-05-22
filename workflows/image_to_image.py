@@ -54,7 +54,6 @@ def _prepare_for_upload(path: Path) -> tuple[Path, dict[str, int], bool]:
     with Image.open(path) as im:
         im = ImageOps.exif_transpose(im)  # применяет orientation и убирает тег
         w, h = im.size
-        rotated = im.getexif().get(0x0112, 1) not in (1, None) if False else False  # уже учтено выше
         ext = path.suffix.lower()
         is_jpeg_already = ext in {".jpg", ".jpeg"} and im.mode == "RGB"
         too_big = max(w, h) > MAX_DIM or path.stat().st_size > 6 * 1024 * 1024

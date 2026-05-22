@@ -16,20 +16,32 @@ Telegram-бот + async Python-обёртка над приватным API Phyg
 > Если venv не активирован — подставь полный путь к интерпретатору: `.venv\Scripts\python.exe`
 > на Windows или `.venv/bin/python` на macOS/Linux.
 
-| Команда | Сценарий | Параметры в пикере |
-|---|---|---|
-| `/menu`, `/start` | главное меню (inline-кнопки) | — |
-| `/brand_generate` | brand text→image (Gemini Text → Nano Banana) | prompt → ratio → resolution |
-| `/brand_img2img` | brand image→image (Gemini Text → Nano Banana с теми же init) | init images → /done → ratio → resolution |
-| `/generate` | text→image | prompt → node → (NB: model/ratio/resolution) \| (GPT: quality/aspect/background) |
-| `/img2img` | image→image (1-4 init) | init images → /done → prompt → node → та же ветка |
-| `/prep_speaker` | портрет спикера в едином стиле | фото → пол → ratio → resolution (NB v3.1, зашитый промпт) |
-| `/cancel`, `/help` | служебные | — |
+Управление — через единое меню. Слэш-команды-ярлыки сценариев убраны (2026-05-20),
+чтобы был один путь — кнопки.
+
+| Команда | Назначение |
+|---|---|
+| `/menu`, `/start` | главное меню |
+| `/cancel` | выйти из текущего сценария / закрыть пикер |
+| `/help` | справка |
+
+Структура меню:
+- **Создай изображение**
+  - **Бренд изображения** — два шага (Gemini Text c вариантным system-prompt → Nano Banana). Варианты:
+    - **Photo** — фотореалистичный брендовый стиль
+    - **Render** — 3D-объекты и продуктовые рендеры
+    - **2d Isometry** — 2D-изометрические сцены и иллюстрации
+  - **Обычное изображение** — text→image напрямую в Nano Banana, без Gemini
+- **Изменить изображение**
+  - **Изменить изображение** — img2img: 1–4 исходника + новый текст
+  - **Добавить Brand patterns** — brand img2img (Gemini сам опишет картинки)
+- **Фотография спикера** — портрет спикера по референсу
+- **Помощь** — справка
 
 ### Brand-сценарии (Cloud.ru Brand Enhancer)
 
-`/brand_generate` и `/brand_img2img` — двухшаговые composer'ы (`workflows/brand_text2img.py`,
-`workflows/brand_img2img.py`):
+Brand text→image (`workflows/brand_text2img.py`) и brand img2img (`workflows/brand_img2img.py`) —
+двухшаговые composer'ы:
 
 1. **Gemini Text** (нода id=72, `pro_3_1`, `thinking_level=high`) с system-prompt-документом
    из `docs/` → возвращает description.
@@ -37,17 +49,46 @@ Telegram-бот + async Python-обёртка над приватным API Phyg
    картинка.
 
 System-prompt-документы лежат в `docs/`:
-- `SYSTEM_PROMPT_Gemini3Pro_CloudRu_Enhancer.md` — text→image (v2.9)
-- `SYSTEM_PROMPT_Gemini3Pro_CloudRu_Img2Img_Enhancer.md` — image→image (v1.0)
+- `SYSTEM_PROMPT_Gemini3Pro_CloudRu_Photo_Enhancer.md` — text→image, вариант **Photo**
+- `SYSTEM_PROMPT_Gemini3Pro_CloudRu_Render_Enhancer.md` — text→image, вариант **Render**
+- `SYSTEM_PROMPT_Gemini3Pro_CloudRu_Isometric_Enhancer.md` — text→image, вариант **2d Isometry**
+- `SYSTEM_PROMPT_Gemini3Pro_CloudRu_Img2Img_Enhancer.md` — image→image
+- `SYSTEM_PROMPT_Gemini3Pro_NanoBanana_Scrubber.md` — surgical-cleaner, чистит флагнутые
+  Nano-Banana safety-классификатором слова из description, сохраняя смысл.
+
+`run_brand_text2img(..., variant="photo"|"render"|"isometric")` выбирает соответствующий .md.
+В `TaskRecipe.params` сохраняется `variant`, чтобы regen использовал тот же system-prompt.
 
 Эти файлы — копии источника в Vault (`Cloud.ru Brand Enhancer` проект). `workflows/brand_docs.py`
 аплоадит каждый файл в Phygital storage **один раз**, кэширует `file_obj_id` + `sha256` в
 `storage/brand_docs.json`. При изменении содержимого (`sha256` mismatch) — переаплоад автоматически.
+То есть можно править .md без правок кода: следующий запрос подхватит новую версию.
+
+#### Safety-retry loop (brand_t2i)
+
+Nano Banana иногда отдаёт `error_params` со словом-нарушителем в payload
+(`Prompt is rejected by safety system. Remove harmful word \`knob\` from the prompt`).
+В `workflows/brand_text2img.py` для этого есть retry-loop:
+
+1. `_extract_flagged_word(error)` парсит слово из текста ошибки.
+2. `_scrub_prompt()` запускает второй Gemini-Text проход с системным промптом
+   `SYSTEM_PROMPT_Gemini3Pro_NanoBanana_Scrubber.md` (доку получаем через `get_scrubber_doc`),
+   передавая ему `FLAGGED WORD: <word>\n\nPROMPT TO FIX:\n<prompt>`. Scrubber хирургически
+   подменяет слово (`knob`→`disc`, `joystick`→`tall post` и т.п.), оставляя остальное.
+3. Чистый prompt отправляется обратно в Nano Banana.
+
+Цикл — до `MAX_SCRUB_RETRIES = 2` попыток. Если после второй всё ещё `error_params` — задача
+завершается `failed` с понятным сообщением. На реальном API проверено в `tests/test_real_api.py:safety_retry`
+(см. `tests/results/run-*/safety_retry/status_log.json`).
+
+#### Progress callback
 
 `brand_text2img` / `brand_img2img` принимают `progress_cb: Callable[[str], Awaitable[None]]` —
-вызывается между Gemini и Nano Banana («Gemini готов, запускаю Nano Banana…»), чтобы юзер
-видел смену стадии в long-running цепочке (Gemini Text медиана 26-60s + Nano Banana ~45s).
-В `_execute_task` это связано со `status.edit_text` (`bot/scenarios.py`).
+вызывается **с именами этапов** (а не свободным текстом):
+`"Gemini Text"` → `"Nano Banana"` → (опционально `"Чистка safety-words: «knob» (попытка N)"`
+→ `"Nano Banana (повтор)"`). `_execute_task` (`bot/scenarios.py`) прокидывает эти строки в
+`StatusReporter.step(...)` — он сам подмешивает elapsed-time и накапливает breakdown для
+финального сообщения. См. ниже секцию «StatusReporter».
 
 **Timeout Gemini Text:** `GeminiTextWorkflow.wait` дефолт = 180s (3× медианы). Залипший таск
 быстро `failed`, не держит `global_sem` 5+ минут.
@@ -55,39 +96,78 @@ System-prompt-документы лежат в `docs/`:
 При ошибке Gemini Text composer возвращает `GenerationJob(status="failed", error="Gemini Text: ...")`
 с `raw={"gemini": ...}` — `_execute_task` показывает понятную отбивку.
 
+### StatusReporter (live-статус задачи)
+
+`bot/status_reporter.py:StatusReporter` — единая точка живой обратной связи по одной задаче.
+Подключается в `_enqueue_task` сразу после создания статус-сообщения, отвечает за весь
+жизненный цикл до `done`/`error`. Состояния:
+
+| Метод | Текст в чате |
+|---|---|
+| `queued(queue_pos=N)` | `{label} — принято` / `очередь №N • 0:00 / ~{eta}` |
+| `waiting_slot()` | `{label} — в очереди` / `жду свободный слот • {elapsed} / ~{eta}` |
+| `start(first_step)` | `{label} — генерация` / `{first_step} • {elapsed} / ~{eta}` |
+| `step(name)` | `{label} — генерация` / `{name} • {elapsed} / ~{eta}` |
+| `done(job_id=…)` | `{label} — готово` + breakdown по этапам + `job {id}` |
+| `error(msg)` / `crashed(msg)` | `{label} — ошибка` / краткое сообщение |
+
+Тикер обновляет elapsed раз в `TICK_SECONDS=3.0` в фоновой `asyncio.Task` (запускается в
+`start`, останавливается в `done/error/crashed`). `step()` записывает длительность
+**предыдущего** этапа в `self._step_times`, который рендерится в финальном сообщении в виде
+`Gemini Text — 0:30 · Nano Banana — 0:55 · ИТОГО — 1:25`. Декоративные эмодзи не используются.
+
+Workflow → первый этап выбирается через `_FIRST_STEP_BY_WORKFLOW` (`bot/scenarios.py`).
+`brand_*` начинают с `"Gemini Text"`, остальные — `"Nano Banana"`. Имена этапов приходят
+из `progress_cb` (см. выше), `StatusReporter` сам ничего о пайплайне не знает.
+
 ### UX-слой: меню и пост-задачные действия
 
-- **Inline-меню** (`MENU_KEYBOARD`): `/menu` и `/start` шлют клавиатуру с 6 кнопками:
-  brand-варианты первыми (`Brand генерация`, `Brand img2img`), затем generic
-  (`Сгенерировать`, `Img2img`, `Speaker prep`, `Help`). Кнопки
-  `menu:brand_generate|brand_img2img|generate|img2img|prep_speaker` идут *прямо в `entry_points`*
-  соответствующих `ConversationHandler` через `CallbackQueryHandler` с нужным `pattern` — то есть
-  кнопка эквивалентна вводу команды. `menu:help` обрабатывается отдельным callback (`menu_router`)
-  и эхает `HELP_TEXT`.
-- **«✖️ Отмена» в пикерах** (`_kb(..., with_cancel=True)`): каждый InlineKeyboard конечного шага
-  (выбор ноды / модели / ratio / resolution / quality / background) внизу имеет ряд `cancel:picker`.
-  Обработчик — `CallbackQueryHandler(cmd_cancel, pattern=r"^cancel:")` в `fallbacks` всех trex
-  conversations: чистит `user_data`, шлёт «отменено», возвращает `ConversationHandler.END`.
-- **Действия на готовой картинке** (`_action_keyboard(task_uid, workflow=...)`):
-  2-row inline-клавиатура:
-  - row 1: `[Повторить]` + (для всех кроме `brand_i2i`) `[Изменить текст]`. У `brand_i2i` нет
-    пользовательского prompt — кнопка прячется.
-  - row 2: `[В img2img]` + `[В brand img2img]` — две раздельные «продолжалки».
+- **Inline-меню** — иерархия (см. выше). Корень (`MENU_KEYBOARD` = `_menu_root_kb()`),
+  подменю `make`/`make_brand`/`edit` — функции в `bot/scenarios.py`. Навигация между
+  подменю и кнопка «Назад» обрабатываются `menu_router` (паттерн
+  `^menu:(root|make|make_brand|edit|help)$`) через `edit_message_text` — пользователь
+  не получает простыни новых сообщений.
+  - Entry-кнопки сценариев (`menu:generate`, `menu:img2img`, `menu:brand_img2img`,
+    `menu:brand_{photo,render,isometric}`, `menu:prep_speaker`) идут *прямо в `entry_points`*
+    `ConversationHandler` через `CallbackQueryHandler` — они до `menu_router` не доходят.
+  - `menu:help` → `menu_router` → отправка `HELP_TEXT` отдельным сообщением.
+- **«Отмена» в пикерах** (`_kb(..., with_cancel=True)`): каждый InlineKeyboard конечного шага
+  (ratio / resolution / gender) внизу имеет ряд `cancel:picker`. Обработчик —
+  `CallbackQueryHandler(cmd_cancel, pattern=r"^cancel:")` в `fallbacks` всех conversations:
+  чистит `user_data`, шлёт «отменено», возвращает `ConversationHandler.END`.
+- **Действия на готовой картинке** (`_action_keyboard(task_uid, workflow=...)`) —
+  раскладка зависит от сценария:
 
-  Callback-data: `regen:{uid}`, `editp:{uid}`, `asi2i:{uid}`, `asbi2i:{uid}`. Живут **24 часа**
-  (`RECIPE_TTL_SEC=86400`).
+  | Сценарий (workflow) | Кнопки |
+  |---|---|
+  | `nb_t2i` (Обычное изображение) | Повторить · Изменить текст · Изменить изображение · Добавить Brand patterns |
+  | `brand_t2i` (Photo/Render/Isometry) | Повторить · Изменить изображение |
+  | `nb_i2i`, `brand_i2i`, `speaker` | Повторить |
+
+  Callback-data осталась та же: `regen:{uid}`, `editp:{uid}`, `asi2i:{uid}` (label
+  «Изменить изображение»), `asbi2i:{uid}` (label «Добавить Brand patterns»).
+  Живут **24 часа** (`RECIPE_TTL_SEC=86400`).
   - `Повторить` → `regen_cb`: достаёт `TaskRecipe` по `task_uid`, диспатчит в `_rerun_from_recipe`,
     суффикс label `(regen)`. Для i2i — копирует init-файлы из `regen_cache` обратно в `task_tmp`.
+    Для brand_t2i — берёт `variant` из `params`.
   - `Изменить текст` → `edit_prompt_cb`: устанавливает `state.set_pending_edit(uid, task_uid)`,
     шлёт исходный prompt в `<pre>`-блоке для копирования. Глобальный `MessageHandler`
     `pending_edit_listener` (группа 1, ниже приоритетом, чем активные conversations) ловит
     следующий текст от юзера → `pop_pending_edit` (одноразовое потребление) → `_rerun_from_recipe`
-    с `prompt_override`, label `(edit)`.
-  - `В img2img` → `as_i2i_cb`: **это `entry_point` `conv_img2img`** с
-    `pattern=r"^asi2i:"`. Колбэк подгружает результат из `regen_cache` в `user_data["init_paths"]`,
-    возвращает `I2I_COLLECT` — пользователь сразу может слать ещё init-картинки или `/done`.
-  - `В brand img2img` → `as_brand_i2i_cb`: **это `entry_point` `conv_brand_i2i`** с
-    `pattern=r"^asbi2i:"`. Аналогично, но возвращает `BI2I_COLLECT` (brand-флоу без prompt-шага).
+    с `prompt_override`, label `(edit)`. Доступна только под результатом `nb_t2i`.
+  - `Изменить изображение` (callback `asi2i:`) → `as_i2i_cb`: **`entry_point` `conv_img2img`**.
+    Подгружает результат из `regen_cache` в `user_data["init_paths"]`, возвращает `I2I_COLLECT`.
+  - `Добавить Brand patterns` (callback `asbi2i:`) → `as_brand_i2i_cb`:
+    **`entry_point` `conv_brand_i2i`**. Аналогично, но `BI2I_COLLECT` (без prompt-шага).
+    Доступна только под результатом `nb_t2i`.
+
+### Startup broadcast
+
+`bot/main.py:_startup_broadcast` при запуске берёт текст `STARTUP_BROADCAST_TEXT`,
+считает его `sha256[:12]`, сверяется с маркером `storage/startup_broadcast.<digest>.flag`.
+Если такого файла нет — шлёт сообщение всем `settings.allowed_user_ids`, пишет маркер
+с отчётом (sent/failed). Меняешь текст → меняется digest → следующий запуск разошлёт
+повторно. Без смены текста рестарт ничего не шлёт.
 
 ### TaskRecipe и regen_cache
 
@@ -117,7 +197,7 @@ System-prompt-документы лежат в `docs/`:
 - `Semaphore(5)` глобально (`settings.bot_max_concurrency`).
 - На пользователя: до **2 задач одновременно** + FIFO-очередь до **5 слотов** (включая активные).
 - Каждый user имеет persistent `asyncio.Task`-воркер, который тянет из своей `asyncio.Queue` и пускает задачи через per-user `Semaphore(2)` и общий глобальный.
-- На входе (`/generate`, `/img2img`, `/prep_speaker`) — capacity-check: если `inflight+queued ≥ 5`, отбивка «слишком много задач, дождись одной из текущих».
+- На входе каждого сценария (entry-points в `bot/scenarios.py`) — capacity-check: если `inflight+queued ≥ 5`, отбивка «очередь заполнена».
 - Каждая задача работает в изолированном `bot/tmp/<uid>/<task_uid>/` — соседняя задача того же юзера не трогает её файлы; чистится в `finally`.
 
 ## CLI (для отладки и батчей)
@@ -161,12 +241,16 @@ bot/
                           task_tmp(uid, task_uid) изоляция, capacity-check API;
                           TaskRecipe + regen_cache + pending_edits + purger-task
   auth.py                 @whitelist_only по PHYGITAL_BOT_WHITELIST
-  scenarios.py            3 ConversationHandler с пикерами + ETA-подсказками
-                          + inline-меню + cancel:picker + action_keyboard;
-                          _enqueue_task → submit_task в очередь,
+  status_reporter.py      StatusReporter: live-статус задачи с elapsed time + breakdown
+                          по этапам, фоновый тикер (3 сек), без декоративных эмодзи
+  scenarios.py            5 ConversationHandler (generate / img2img / brand_t2i / brand_i2i /
+                          prep_speaker) с пикерами + ETA-подсказками + inline-меню +
+                          cancel:picker + action_keyboard; _enqueue_task создаёт
+                          StatusReporter и кладёт задачу в per-user queue;
                           _execute_task под global_sem с cleanup_paths/task_tmp;
                           _persist_recipe + _rerun_from_recipe для пост-задачных действий;
-                          pending_edit_listener (group=1, не перебивает активные conv)
+                          pending_edit_listener (group=1, не перебивает активные conv);
+                          _FIRST_STEP_BY_WORKFLOW → начальный этап для StatusReporter
   tmp/<uid>/<task_uid>/   изолированный рабочий каталог одной задачи (auto-cleanup)
   regen_cache/<uid>/      24-часовый кэш init+result для повторных запусков
 cli.py                    argparse: generate, prep-speaker, session
@@ -209,6 +293,21 @@ playwright install chromium
 Дальше команды в README даны в нейтральной форме (`python …`) — venv предполагается активированным.
 
 ## Bootstrap сессии
+
+> **Авторизация — только через recon.** У Phygital+ нет публичного API и нет login-by-password
+> ручки. Cookies/JWT попадают в `storage/session.json` **только** после прогона
+> `python -m recon.capture` — Playwright откроет Chromium, в нём ты логинишься руками своим
+> аккаунтом, recon экспортирует cookies. Без этого ни бот, ни CLI, ни тесты не стартуют.
+>
+> **Смена аккаунта** = снести старое состояние и прогнать capture заново:
+> ```bash
+> rm storage/session.json
+> rm -rf user_data/          # persistent-профиль Chromium с залогиненным юзером
+> python -m recon.capture    # залогиниться новым аккаунтом
+> ```
+> Никаких `PHYGITAL_EMAIL/PASSWORD` в `.env` нет — это конфиг не используется кодом
+> (фантомные поля из ранней версии). Аутентификация всегда идёт через сохранённую
+> SuperTokens-сессию + auto-refresh.
 
 1. **Полный capture (если профиля ещё нет):**
    ```bash
@@ -325,7 +424,7 @@ python -m tools.digest --out reports/week.md
 ```
 
 Что в отчёте:
-1. **Сценарии** — счётчики запусков `/generate`, `/img2img`, `/prep_speaker` + rerun по workflow.
+1. **Сценарии** — счётчики запусков по workflow (`nb_t2i`/`nb_i2i`/`brand_t2i`/`brand_i2i`/`speaker`) + rerun.
 2. **Результаты задач** — completed/total, средняя/медианная длительность, картинок отдано.
 3. **HTTP-запросы** — счётчики по endpoint'ам (queue-position бакетируется в один, поэтому polling
    не зашумляет картину).
@@ -337,11 +436,54 @@ context manager на `_request`).
 
 ## Тесты
 
-- `tests/test_bot_emulation.py` — реальный эмуляционный ран ConversationHandler-ов с моками
-  `cli.load_session` и `bot.auth._is_allowed`. Покрывает: меню → conv через CallbackQuery,
-  полный t2i-сценарий, регистрацию recipe + action keyboard, regen / edit-prompt / asi2i,
-  cancel:picker, expired recipe, capacity-check, persist init-файлов в `regen_cache` при i2i.
-  Запуск (после активации venv): `python -m tests.test_bot_emulation`.
+Два эшелона: **mocked harness** (быстро, без API) и **real-API harness** (тратит кредиты).
+
+### `tests/test_bot_emulation.py` — mocked harness (12 сценариев)
+
+Эмуляционный прогон ConversationHandler'ов с моками `cli.load_session`, `bot.auth._is_allowed`,
+`PhygitalClient`, workflow-классов. Меню → conv через CallbackQuery, без сетевых вызовов.
+
+Покрытие:
+1. `menu:help` callback
+2. полный t2i + все пост-задачные кнопки (regen / edit / asi2i / asbi2i) + cancel + capacity-check
+3. img2img recipe сохраняет init-файлы в `regen_cache`
+4. brand_t2i полный флоу + regen (variant=photo)
+5. brand_i2i полный флоу + kb без «Изменить текст» + regen
+6. brand_t2i variant=render
+7. brand_t2i variant=isometric
+8. prep_speaker полный флоу + cleanup_paths
+9. **safety-scrubber retry loop** — мокаем Gemini/Nano так, что Nano первый раз отдаёт
+   `error_params: 'knob'`, проверяем что Gemini-scrubber вызван (с doc_id скраббера) и
+   что результат retry-Nano = completed. Проверяет последовательность progress-событий.
+10. cancel:picker в разных FSM-стейтах (GEN_RATIO / I2I_PROMPT / SP_GENDER)
+11. `StatusReporter.queued/waiting_slot/start/step/done/error` — формат сообщений
+12. whitelist reject — non-whitelist user получает reject-сообщение, в FSM не входит
+
+Запуск: `python -m tests.test_bot_emulation`. Все 12 проходят за ~2 сек.
+
+### `tests/test_real_api.py` — real-API harness (тратит кредиты)
+
+Прямые вызовы Phygital через `PhygitalClient` (harness-level, без Telegram). Использует
+`storage/session.json`; сессия рефрешится автоматически. Артефакты — в
+`tests/results/run-{YYYYMMDD-HHMMSS}/{scenario}/`:
+
+```
+result.{jpg,png}        — финальное изображение
+prompt.txt              — итоговый prompt + Gemini description если был
+status_log.json         — поток progress-events + final job status
+timing.json             — wall-clock тайминги: start, end, total, per-step
+```
+
+Сценарии: `nb_t2i`, `nb_i2i`, `brand_t2i_photo`, `brand_t2i_render`, `brand_t2i_isometric`,
+`brand_i2i`, `speaker`, `safety_retry` (намеренно триггерит slovo «knob»). После прогона —
+`summary.json` в корне run-папки.
+
+Бюджет: ~600-800 кредитов на полный прогон (зависит от текущих цен нод). Запуск:
+`python -m tests.test_real_api`.
+
+> Подсказка: чтобы дёшево проверить session/auth — запусти один сценарий вручную через
+> `import tests.test_real_api` и вызови `run_scenario_nb_t2i(client, dir)` (см. smoke-блок
+> в истории).
 
 ## Что дальше
 
