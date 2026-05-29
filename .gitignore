@@ -30,7 +30,20 @@ logs/
 bot/tmp/
 bot/regen_cache/
 storage/brand_docs.json
+storage/*.flag
 outputs/
+
+# Test/recon результаты — могут содержать AWS-подписанные URL, user_id и
+# изображения пользователей. Никогда не коммитить.
+tests/results/
+recon/results/
+
+# Пользовательские фотографии в input/ — face-данные. Допускается коммитить
+# только заведомо обезличенные ассеты с явным пермитом.
+input/*.jpg
+input/*.jpeg
+input/*.png
+input/*.webp
 
 # OS / IDE
 .DS_Store

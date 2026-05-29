@@ -79,6 +79,13 @@ def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def _redact_url(url: str) -> str:
+    """Срезаем query-string у result_urls — там лежат AWS signed-URL credentials
+    (AWSAccessKeyId, Signature, Expires), которые нельзя коммитить в публичный
+    репозиторий. Оставляем только путь к ассету для трассировки."""
+    return url.split("?", 1)[0]
+
+
 def _save_artifacts(
     scenario_dir: Path,
     *,
@@ -98,7 +105,7 @@ def _save_artifacts(
                     "job_id": job.job_id,
                     "status": job.status,
                     "error": job.error,
-                    "result_urls": job.result_urls,
+                    "result_urls": [_redact_url(u) for u in job.result_urls],
                 },
             },
             indent=2,
