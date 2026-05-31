@@ -538,8 +538,10 @@ async def scenario_brand_i2i_flow():
         "brand_i2i kb не должен содержать «Изменить изображение»"
     assert not any("Добавить Brand patterns" == b.text for b in btns), \
         "brand_i2i kb не должен содержать «Добавить Brand patterns»"
-    assert len(btns) == 1, f"brand_i2i kb expected 1 button (Повторить), got {len(btns)}"
-    print("  ✓ kb brand_i2i: [Повторить] only")
+    # «Повторить» + 👍/👎 (feedback rating row добавлен ко всем сценариям).
+    assert len(btns) == 3, f"brand_i2i kb expected 3 buttons (Повторить + 👍 + 👎), got {len(btns)}: {[b.text for b in btns]}"
+    assert any(b.text == "👍" for b in btns) and any(b.text == "👎" for b in btns)
+    print("  ✓ kb brand_i2i: [Повторить] + 👍/👎 only")
 
     # Regen — должен ещё раз вызвать run_brand_img2img со скопированными init
     captured.clear()
@@ -751,9 +753,11 @@ async def scenario_prep_speaker_flow():
         _, _, hx = b.callback_data.split(":")
         assert len(hx) == 6 and all(c in "0123456789ABCDEF" for c in hx), \
             f"некорректный HEX в кнопке: {b.callback_data!r}"
-    assert len(btns) == 1 + 5, \
-        f"speaker kb expected 1 + 5 buttons, got {len(btns)}: {[b.text for b in btns]}"
-    print("  ✓ kb speaker: [Повторить] + 5 цветов «Сменить фон»")
+    # Повторить + 5 цветов + 👍/👎
+    assert len(btns) == 1 + 5 + 2, \
+        f"speaker kb expected 1 + 5 + 2 buttons, got {len(btns)}: {[b.text for b in btns]}"
+    assert any(b.text == "👍" for b in btns) and any(b.text == "👎" for b in btns)
+    print("  ✓ kb speaker: [Повторить] + 5 цветов «Сменить фон» + 👍/👎")
 
     # cleanup: исходный photo удалён
     assert not photo.exists(), "speaker_photo должен быть удалён через cleanup_paths"
@@ -993,6 +997,201 @@ async def scenario_whitelist_reject():
     print("  ✓ non-whitelist user → None + reject-msg")
 
 
+async def scenario_feedback_survey_flow():
+    """Подсистема обратной связи: меню → опрос (single + multi + skip + submit),
+    рейтинг 👍, комментарий, авто-prompt после N-й генерации.
+
+    Дополнительно проверяем: rating_kb появляется в _action_keyboard для всех
+    workflow'ов и записи в JSONL формируются корректно.
+    """
+    import json
+    import tempfile
+    from pathlib import Path as _Path
+
+    from bot import feedback as fb
+    from bot import scenarios as scn
+
+    # Изолируем feedback в tmp-директории чтобы не засорять реальный storage/
+    with tempfile.TemporaryDirectory() as tmp:
+        events = _Path(tmp) / "feedback.jsonl"
+        state_file = _Path(tmp) / "feedback_state.json"
+        with patch.object(fb, "FEEDBACK_DIR", _Path(tmp)), \
+             patch.object(fb, "EVENTS_FILE", events), \
+             patch.object(fb, "STATE_FILE", state_file):
+            fb.reset_feedback_store_for_tests()
+
+            user = make_user(777)
+            chat = make_chat(777)
+            ctx = make_context()
+
+            # === 1. menu:feedback → подменю ===
+            upd = make_callback_update("menu:feedback", user, chat)
+            await fb.feedback_menu_cb(upd, ctx)
+            upd.callback_query.edit_message_text.assert_awaited_once()
+            kb = upd.callback_query.edit_message_text.await_args.kwargs["reply_markup"]
+            labels = [b.text for row in kb.inline_keyboard for b in row]
+            assert "Пройти опрос" in labels, f"submenu missing survey: {labels}"
+            assert "Оставить комментарий" in labels
+            # owner-only stats — uid 777 не owner → не должно быть.
+            assert "Статистика" not in labels
+            print("  ✓ menu:feedback показал подменю без 'Статистика' (non-owner)")
+
+            # === 2. start survey ===
+            upd = make_callback_update("fb:menu:survey", user, chat)
+            await fb.feedback_action_cb(upd, ctx)
+            assert "fb_survey" in ctx.user_data
+            assert ctx.user_data["fb_survey"]["step"] == 0
+            print("  ✓ fb:menu:survey стартовал опрос (step=0)")
+
+            # === 3. A1 = multi: toggle + next ===
+            # Q0 = A1 (multi). Тоггл brand_photo + presentations(нет — это A4), потом next.
+            upd = make_callback_update("fb:srv:toggle:brand_photo", user, chat)
+            await fb.survey_cb(upd, ctx)
+            assert "brand_photo" in ctx.user_data["fb_survey"]["pending_multi"]
+            upd = make_callback_update("fb:srv:next", user, chat)
+            await fb.survey_cb(upd, ctx)
+            assert ctx.user_data["fb_survey"]["answers"]["A1"] == ["brand_photo"]
+            assert ctx.user_data["fb_survey"]["step"] == 1
+            print("  ✓ A1 multi: toggle+next записал ['brand_photo'], step → 1")
+
+            # === 4. A2 = single: pick ===
+            upd = make_callback_update("fb:srv:pick:all_needed", user, chat)
+            await fb.survey_cb(upd, ctx)
+            assert ctx.user_data["fb_survey"]["answers"]["A2"] == "all_needed"
+            assert ctx.user_data["fb_survey"]["step"] == 2
+            print("  ✓ A2 single: pick all_needed")
+
+            # === 5. A3 = free: skip ===
+            upd = make_callback_update("fb:srv:skip", user, chat)
+            await fb.survey_cb(upd, ctx)
+            assert "A3" in ctx.user_data["fb_survey"]["skipped"]
+            assert ctx.user_data["fb_survey"]["step"] == 3
+            print("  ✓ A3 free: skip")
+
+            # === 6. Пропустим остальные через skip и проверим submit ===
+            for expected_step in range(3, len(fb.SURVEY_QUESTIONS)):
+                upd = make_callback_update("fb:srv:skip", user, chat)
+                await fb.survey_cb(upd, ctx)
+            # После последнего skip — show_summary, step == len
+            assert ctx.user_data["fb_survey"]["step"] == len(fb.SURVEY_QUESTIONS)
+            print(f"  ✓ остальные {len(fb.SURVEY_QUESTIONS)-3} вопросов skipped, дошли до summary")
+
+            # === 7. submit ===
+            upd = make_callback_update("fb:srv:submit", user, chat)
+            await fb.survey_cb(upd, ctx)
+            assert "fb_survey" not in ctx.user_data
+            # JSONL должен содержать одно событие survey
+            assert events.exists(), "feedback.jsonl must be created on submit"
+            lines = events.read_text(encoding="utf-8").strip().splitlines()
+            assert len(lines) == 1
+            ev = json.loads(lines[0])
+            assert ev["type"] == "survey"
+            assert ev["uid"] == 777
+            assert ev["answers"]["A1"] == ["brand_photo"]
+            assert ev["answers"]["A2"] == "all_needed"
+            assert "A3" in ev["skipped"]
+            assert ev["survey_version"] == fb.SURVEY_VERSION
+            print(f"  ✓ submit: записано в JSONL, version={ev['survey_version']}, {len(ev['answers'])} ответов")
+
+            # === 8. Состояние юзера — опрос помечен как пройденный ===
+            st = fb.get_feedback_store().get_uid_state(777)
+            assert st["survey_completed_version"] == fb.SURVEY_VERSION
+            assert st["surveys_total"] == 1
+            print("  ✓ uid state: survey_completed_version выставлен")
+
+            # === 9. Повторный вход в подменю — лейбл "Пройти опрос ещё раз" ===
+            upd = make_callback_update("menu:feedback", user, chat)
+            await fb.feedback_menu_cb(upd, ctx)
+            kb = upd.callback_query.edit_message_text.await_args.kwargs["reply_markup"]
+            labels = [b.text for row in kb.inline_keyboard for b in row]
+            assert "Пройти опрос ещё раз" in labels
+            print("  ✓ при повторном входе кнопка → 'Пройти опрос ещё раз'")
+
+            # === 10. Rating 👍 без причин ===
+            upd = make_callback_update("fb:rate:abc123:nb_t2i:up", user, chat)
+            await fb.rating_cb(upd, ctx)
+            lines = events.read_text(encoding="utf-8").strip().splitlines()
+            assert len(lines) == 2
+            ev = json.loads(lines[1])
+            assert ev["type"] == "rating"
+            assert ev["value"] == "up"
+            assert ev["task_uid"] == "abc123"
+            assert ev["workflow"] == "nb_t2i"
+            print("  ✓ rating up записан в JSONL")
+
+            # === 11. Comment flow ===
+            upd = make_callback_update("fb:cmt:idea", user, chat)
+            await fb.comment_category_cb(upd, ctx)
+            assert ctx.user_data["fb_pending"]["kind"] == "comment"
+            assert ctx.user_data["fb_pending"]["category"] == "idea"
+            # Юзер шлёт текст → feedback_text_listener
+            upd = make_message_update("Хочу батч-генерацию по 10 картинок", user, chat)
+            await fb.feedback_text_listener(upd, ctx)
+            assert "fb_pending" not in ctx.user_data
+            lines = events.read_text(encoding="utf-8").strip().splitlines()
+            assert len(lines) == 3
+            ev = json.loads(lines[2])
+            assert ev["type"] == "comment"
+            assert ev["category"] == "idea"
+            assert "батч" in ev["text"]
+            print("  ✓ comment: категория idea + текст записаны")
+
+            # === 12. Auto-prompt: после 3-й успешной генерации триггерится ===
+            store = fb.get_feedback_store()
+            # uid юзера с уже survey_completed_version → НЕ должен получать prompt
+            assert not store.should_auto_prompt(777)
+            # Свежий uid → after 3 успехов должен сработать.
+            fresh = 999
+            assert not store.should_auto_prompt(fresh)  # 0 генераций
+            await store.mark_generation_success(fresh)
+            await store.mark_generation_success(fresh)
+            assert not store.should_auto_prompt(fresh)  # 2 — рано
+            await store.mark_generation_success(fresh)
+            assert store.should_auto_prompt(fresh), "after 3rd success — должен предложить"
+            print("  ✓ should_auto_prompt: триггер на 3-й успешной генерации")
+
+            # === 13. on_generation_success реально шлёт баннер ===
+            sent: list = []
+            async def send_fn(text, reply_markup=None):
+                sent.append((text, reply_markup))
+            # fresh uid уже на 3 успехах — следующий вызов on_generation_success
+            # инкрементит до 4 и (т.к. should_auto_prompt всё ещё True) шлёт баннер.
+            await fb.on_generation_success(fresh, send_fn)
+            assert len(sent) == 1, f"банер не отправлен: {sent}"
+            text, kb = sent[0]
+            assert "опрос" in text.lower()
+            kb_labels = [b.text for row in kb.inline_keyboard for b in row]
+            assert "Пройти" in kb_labels
+            assert "Не сейчас" in kb_labels
+            assert "Не показывать" in kb_labels
+            print("  ✓ on_generation_success: баннер отправлен с кнопками")
+
+            # === 14. 'Не показывать' → больше не предлагаем ===
+            upd = make_callback_update("fb:auto:never", user, chat)
+            upd.effective_user = make_user(fresh)
+            await fb.auto_prompt_cb(upd, ctx)
+            assert not store.should_auto_prompt(fresh)
+            st_fresh = store.get_uid_state(fresh)
+            assert st_fresh["survey_completed_version"] == f"{fb.SURVEY_VERSION}_declined"
+            print("  ✓ 'Не показывать' выставляет declined-флаг, prompts отключены")
+
+            # === 15. rating_kb присутствует в _action_keyboard для всех workflow ===
+            for wf in ("nb_t2i", "brand_t2i", "speaker", "nb_i2i", "brand_i2i"):
+                kb = scn._action_keyboard("test_uid", workflow=wf)
+                all_data = [b.callback_data for row in kb.inline_keyboard for b in row]
+                assert any(d.startswith("fb:rate:test_uid:") and d.endswith(":up") for d in all_data), \
+                    f"workflow={wf} missing 👍: {all_data}"
+                assert any(d.startswith("fb:rate:test_uid:") and d.endswith(":down") for d in all_data), \
+                    f"workflow={wf} missing 👎: {all_data}"
+            print("  ✓ _action_keyboard содержит 👍/👎 для всех workflow")
+
+            # === 16. menu_root_kb содержит 'Обратная связь' ===
+            root_kb = scn._menu_root_kb()
+            root_labels = [b.text for row in root_kb.inline_keyboard for b in row]
+            assert "Обратная связь" in root_labels
+            print("  ✓ _menu_root_kb содержит 'Обратная связь'")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # main runner
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1038,6 +1237,9 @@ async def main():
 
         print("\n━━━ SCENARIO 12: whitelist reject ━━━")
         await scenario_whitelist_reject()
+
+        print("\n━━━ SCENARIO 13: feedback — меню/опрос/rating/comment/auto-prompt ━━━")
+        await scenario_feedback_survey_flow()
 
     print("\n✅ ALL SCENARIOS PASSED")
 

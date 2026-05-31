@@ -77,23 +77,12 @@ HELP_TEXT = (
 # Меняешь текст → меняется хэш → бот при следующем запуске разошлёт повторно
 # и положит новый marker-файл. Без смены текста — повторных рассылок нет.
 STARTUP_BROADCAST_TEXT = (
-    "Бот обновлён и снова на связи.\n\n"
-    "Главное меню перестроено — открывается одной командой /menu или /start.\n"
-    "Бренд-генерация теперь делится на три варианта: Photo, Render и 2d Isometry.\n"
-    "Слэш-команды сценариев убраны: всё доступно через кнопки.\n\n"
-    "Если что-то ведёт себя странно — пиши, разберёмся."
+    "Бот запущен и работает до конца рабочего дня.\n\n"
+    "Появилась обратная связь: в главном меню — кнопка «Обратная связь».\n"
+    "Под каждым результатом — 👍 / 👎, чтобы быстро отметить попадание.\n\n"
+    "Если будет минутка — пройди короткий опрос (12 вопросов, можно пропускать). "
+    "Поможет понять, куда двигать бота дальше: /menu → «Обратная связь» → «Пройти опрос»."
 )
-
-
-# Ежедневный startup-notice. Шлётся ВСЕГДА при запуске (без sha256-маркера) —
-# в отличие от STARTUP_BROADCAST_TEXT, который рассылается один раз на версию текста.
-DAILY_STARTUP_NOTICE_TEXT = (
-    "Бот снова на связи и готов к генерациям."
-)
-
-
-# Сообщение при остановке. Шлётся ВСЕГДА (через post_stop-хук PTB).
-SHUTDOWN_NOTICE_TEXT = "Бот ушёл на перерыв. До завтра."
 
 
 @whitelist_only
@@ -225,43 +214,6 @@ async def _post_init(app: Application) -> None:
         await _startup_broadcast(app)
     except Exception as e:
         logger.opt(exception=e).warning(f"startup broadcast crashed: {e!r}")
-    # Ежедневное «бот на смене» — шлётся при каждом запуске, без sha-маркера.
-    try:
-        await _broadcast_to_allowed(app, DAILY_STARTUP_NOTICE_TEXT, tag="daily startup notice")
-    except Exception as e:
-        logger.opt(exception=e).warning(f"daily startup notice crashed: {e!r}")
-
-
-async def _post_stop(app: Application) -> None:
-    """Хук вызывается между Updater.stop() и Application.shutdown() —
-    bot ещё может отправлять сообщения. Шлём «ушёл на перерыв» и не валим
-    остановку при ошибках сети."""
-    try:
-        await _broadcast_to_allowed(app, SHUTDOWN_NOTICE_TEXT, tag="shutdown notice")
-    except Exception as e:
-        logger.opt(exception=e).warning(f"shutdown notice crashed: {e!r}")
-
-
-async def _broadcast_to_allowed(app: Application, text: str, *, tag: str) -> None:
-    """Разослать сообщение всем allowed_user_ids. В отличие от _startup_broadcast
-    не использует sha256-маркер — шлёт всегда. Ошибки по конкретным uid не валят
-    рассылку остальным."""
-    text = text.strip()
-    if not text:
-        return
-    uids = list(settings.allowed_user_ids)
-    if not uids:
-        logger.info(f"{tag}: allowed_user_ids пуст — нечего рассылать")
-        return
-    logger.info(f"{tag}: рассылаю на {len(uids)} uid(ов)")
-    sent = 0
-    for uid in uids:
-        try:
-            await app.bot.send_message(uid, text)
-            sent += 1
-        except Exception as e:
-            logger.warning(f"{tag} → {uid} failed: {type(e).__name__}: {e}")
-    logger.info(f"{tag} done: sent={sent}/{len(uids)}")
 
 
 # storage/startup_broadcast.<digest>.flag — маркер «эту версию текста мы уже разослали».
@@ -351,7 +303,6 @@ def build_app() -> Application:
     if poll_req is not None:
         builder = builder.get_updates_request(poll_req)
     builder = builder.post_init(_post_init)
-    builder = builder.post_stop(_post_stop)
     app = builder.build()
 
     # Group=-1: лог всех апдейтов до того, как их разберут conversations.

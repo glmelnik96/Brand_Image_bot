@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     telegram_proxy_url: str = ""  # http://host:port; пусто = без прокси
     telegram_proxy_cert: str = ""  # path к PEM CA прокси; пусто = truststore (keychain)
     bot_max_concurrency: int = 5
+    # CSV uid'ов, которым доступна админская статистика по фидбэку.
+    bot_owner_uids: str = ""
 
     session_file: Path = ROOT / "storage" / "session.json"
 
@@ -29,6 +31,11 @@ class Settings(BaseSettings):
     @property
     def allowed_user_ids(self) -> set[int]:
         ids = (x.strip() for x in self.telegram_allowed_user_ids.split(","))
+        return {int(x) for x in ids if x}
+
+    @property
+    def owner_user_ids(self) -> set[int]:
+        ids = (x.strip() for x in self.bot_owner_uids.split(","))
         return {int(x) for x in ids if x}
 
 

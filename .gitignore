@@ -31,6 +31,10 @@ bot/tmp/
 bot/regen_cache/
 storage/brand_docs.json
 storage/*.flag
+# Обратная связь — JSONL событий + per-uid state. PII (свободный текст юзеров).
+storage/feedback.jsonl
+storage/feedback_state.json
+storage/feedback_state.json.tmp
 outputs/
 
 # Test/recon результаты — могут содержать AWS-подписанные URL, user_id и

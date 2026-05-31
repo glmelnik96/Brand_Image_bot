@@ -59,6 +59,11 @@ from telegram.ext import (
 )
 
 from bot.auth import whitelist_only
+from bot.feedback import (
+    build_feedback_handlers,
+    on_generation_success,
+    rating_kb,
+)
 from bot.state import USER_QUEUE_LIMIT, TaskRecipe, get_state
 from bot.status_reporter import StatusReporter
 from client.api import _SSL_CTX, PhygitalClient
@@ -208,6 +213,8 @@ def _action_keyboard(task_uid: str, *, workflow: str = "nb_t2i") -> InlineKeyboa
         if color_btns[3:]:
             rows.append(color_btns[3:])
     # nb_i2i / brand_i2i — только «Повторить»
+    # 👍/👎 — последняя строка для всех сценариев.
+    rows.append(rating_kb(task_uid, workflow))
     return InlineKeyboardMarkup(rows)
 
 
@@ -223,6 +230,7 @@ def _menu_root_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("Создай изображение", callback_data="menu:make")],
         [InlineKeyboardButton("Изменить изображение", callback_data="menu:edit")],
         [InlineKeyboardButton("Фотография спикера", callback_data="menu:prep_speaker")],
+        [InlineKeyboardButton("Обратная связь", callback_data="menu:feedback")],
         [InlineKeyboardButton("Помощь", callback_data="menu:help")],
     ])
 
@@ -451,6 +459,15 @@ async def _execute_task(
                     )
                 except Exception as e:
                     log.opt(exception=e).warning(f"recipe save failed: {e!r}")
+
+            # Хук обратной связи: считаем успешную генерацию + (по триггеру) шлём баннер опроса.
+            # Не блокируем основной поток исключениями из feedback-подсистемы.
+            try:
+                async def _send_followup(text: str, reply_markup=None):
+                    await chat.send_message(text, reply_markup=reply_markup)
+                await on_generation_success(uid, _send_followup)
+            except Exception as e:
+                log.opt(exception=e).warning(f"feedback hook failed: {e!r}")
         elif job.status == "completed":
             log.error("completed but result_urls is empty")
             await reporter.error("задача завершилась, но Phygital не вернул ссылки на файлы")
@@ -1874,6 +1891,8 @@ def build_extra_handlers() -> list:
         ("group0", CallbackQueryHandler(regen_cb, pattern=r"^regen:")),
         ("group0", CallbackQueryHandler(edit_prompt_cb, pattern=r"^editp:")),
         ("group0", CallbackQueryHandler(speaker_bg_cb, pattern=r"^spkrbg:")),
+        # Подсистема обратной связи: menu:feedback + все fb:* callback'и + listener текста.
+        *build_feedback_handlers(),
         # Глобальный listener в group=1 — после conversations.
         ("group1", MessageHandler(filters.TEXT & ~filters.COMMAND, pending_edit_listener)),
     ]
