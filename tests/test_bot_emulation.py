@@ -375,7 +375,7 @@ async def scenario_menu_help_callback():
     upd.callback_query.answer.assert_awaited()
     assert upd.callback_query.message.reply_text.await_count >= 1
     sent = upd.callback_query.message.reply_text.await_args.args[0]
-    assert "Cloud.ru Image Bot" in sent and "/menu" in sent
+    assert "Brand Image Bot" in sent and "/menu" in sent
     print("  ✓ menu:help → HELP_TEXT отправлен")
 
 

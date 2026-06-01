@@ -1,6 +1,6 @@
 @echo off
 REM =====================================================================
-REM  Cloud.ru Image Bot - start.
+REM  Brand Image Bot - start.
 REM  Double-click runs the bot in this console window with logs.
 REM  Ctrl+C stops it. After exit, window stays open (pause) so you can
 REM  read the traceback if the bot crashed.
@@ -11,7 +11,7 @@ REM  the parser. chcp below switches only the *output* encoding.
 REM =====================================================================
 
 chcp 65001 > nul
-title Cloud.ru Image Bot
+title Brand Image Bot
 
 cd /d "%~dp0"
 
@@ -43,7 +43,7 @@ if errorlevel 1 (
 )
 
 echo --------------------------------------------------------------
-echo  Cloud.ru Image Bot
+echo  Brand Image Bot
 echo  cwd: %CD%
 echo  Press Ctrl+C to stop.
 echo --------------------------------------------------------------

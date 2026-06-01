@@ -129,7 +129,7 @@ def bucket_http(msg: str) -> str | None:
 
 def render(stats: dict, since: datetime | None) -> str:
     out: list[str] = []
-    out.append("# Cloud.ru Image Bot — digest")
+    out.append("# Brand Image Bot — digest")
     if since:
         out.append(f"\n_Период: с {since.isoformat(timespec='seconds')} по {datetime.now().isoformat(timespec='seconds')}._")
     else:

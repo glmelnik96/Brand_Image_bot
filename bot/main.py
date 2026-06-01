@@ -37,7 +37,7 @@ from client.config import ROOT, settings
 
 # ── /start, /help ──────────────────────────────────────────────────────────
 HELP_TEXT = (
-    "Cloud.ru Image Bot — генерация и редактирование картинок.\n\n"
+    "Brand Image Bot — генерация и редактирование картинок.\n\n"
     "Управление — только меню (/menu или /start). Слэш-команды-ярлыки сняты,\n"
     "чтобы один и тот же путь шёл через кнопки.\n\n"
     "Структура меню:\n"
@@ -88,7 +88,7 @@ STARTUP_BROADCAST_TEXT = (
 @whitelist_only
 async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Привет! Это Cloud.ru Image Bot — генерация и редактирование картинок.\n"
+        "Привет! Это Brand Image Bot — генерация и редактирование картинок.\n"
         "Выбери сценарий кнопкой ниже или открой /help, если нужны подробности.",
         reply_markup=MENU_KEYBOARD,
     )
