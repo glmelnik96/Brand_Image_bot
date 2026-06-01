@@ -1,6 +1,6 @@
 @echo off
 REM =====================================================================
-REM  Phygital-bot - start.
+REM  Cloud.ru Image Bot - start.
 REM  Double-click runs the bot in this console window with logs.
 REM  Ctrl+C stops it. After exit, window stays open (pause) so you can
 REM  read the traceback if the bot crashed.
@@ -11,7 +11,7 @@ REM  the parser. chcp below switches only the *output* encoding.
 REM =====================================================================
 
 chcp 65001 > nul
-title Phygital-bot
+title Cloud.ru Image Bot
 
 cd /d "%~dp0"
 
@@ -43,7 +43,7 @@ if errorlevel 1 (
 )
 
 echo --------------------------------------------------------------
-echo  Phygital-bot
+echo  Cloud.ru Image Bot
 echo  cwd: %CD%
 echo  Press Ctrl+C to stop.
 echo --------------------------------------------------------------

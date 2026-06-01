@@ -1,4 +1,4 @@
-# Phygital-bot
+# Cloud.ru Image Bot
 
 Telegram-бот + async Python-обёртка над приватным API Phygital+ (`app.phygital.plus`) для скриптовой
 генерации изображений на платной подписке. Публичного API нет — клиент собран по recon HAR-капчам.
