@@ -44,6 +44,10 @@ IMG2IMG_DOC = "SYSTEM_PROMPT_Gemini3Pro_CloudRu_Img2Img_Enhancer.md"
 # принимающий «PROMPT TO FIX + FLAGGED WORD» и возвращающий почищенный промпт.
 SCRUBBER_DOC = "SYSTEM_PROMPT_Gemini3Pro_NanoBanana_Scrubber.md"
 
+# «Who is who» — system-prompt для Gemini Flash перед Midjourney.
+# Перевод словосочетаний на английский + случайная перетасовка слов.
+WHOISWHO_DOC = "SYSTEM_PROMPT_WhoIsWho.md"
+
 VARIANT_DOCS: dict[str, str] = {
     "photo": PHOTO_DOC,
     "render": RENDER_DOC,
@@ -150,3 +154,8 @@ async def get_img2img_doc(client: PhygitalClient) -> int:
 async def get_scrubber_doc(client: PhygitalClient) -> int:
     """file_obj_id для Nano Banana safety-word scrubber'а."""
     return await get_brand_doc_id(client, SCRUBBER_DOC)
+
+
+async def get_whoiswho_doc(client: PhygitalClient) -> int:
+    """file_obj_id для Who-is-who system-prompt (Gemini Flash перед Midjourney)."""
+    return await get_brand_doc_id(client, WHOISWHO_DOC)

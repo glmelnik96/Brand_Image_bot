@@ -24,11 +24,12 @@ import asyncio
 import uuid
 from typing import Any
 
+import httpx
 from loguru import logger
 
 from client.api import PhygitalClient
 from client.models import GenerationJob
-from workflows.base import Workflow
+from workflows.base import ProgressCallback, Workflow
 from workflows.image_gen import DONE_STATUSES, FAIL_STATUSES, PENDING_STATUSES
 
 NODE_GLOBAL_ID = "Phygital Creator/phygc-rnd-gemini-text-api"
@@ -41,6 +42,8 @@ class GeminiTextWorkflow(Workflow):
     """Single-node Gemini Text. Возвращает description как result_text."""
 
     workflow_id = str(WORKFLOW_SCHEMA_ID)
+    # Медиана Gemini Text (Pro thinking=high) — 26–60s по логам.
+    EXPECTED_DURATION_S = 40.0
 
     def __init__(
         self,
@@ -218,10 +221,13 @@ class GeminiTextWorkflow(Workflow):
         # 180s ≈ 3× медианы Gemini Text (26–60s по логам). Залипший таск не должен
         # держать global_sem 5+ минут — лучше быстро failed и юзер ретраит.
         task_id = int(job_id)
-        deadline = asyncio.get_event_loop().time() + timeout
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
         last_status: str | None = None
+        last_progress: float | None = None
+        running_started_at: float | None = None
 
-        while asyncio.get_event_loop().time() < deadline:
+        while loop.time() < deadline:
             data = await self.client.task_status(task_id)
             status = (data.get("status") or "").lower()
             if status != last_status:
@@ -230,6 +236,16 @@ class GeminiTextWorkflow(Workflow):
                     f"(position={data.get('position')}, progress={data.get('progress')})"
                 )
                 last_status = status
+
+            if status in ("running", "in_progress"):
+                if running_started_at is None:
+                    running_started_at = loop.time()
+                raw = data.get("progress")
+                if raw is not None:
+                    last_progress = await self._emit_progress(raw, last_progress)
+                else:
+                    synth = self._synth_progress(running_started_at, loop.time())
+                    last_progress = await self._push_progress(synth, last_progress)
 
             if status in DONE_STATUSES:
                 text = self._extract_description(data.get("outputs") or [], raw=data)
@@ -295,3 +311,75 @@ class GeminiTextWorkflow(Workflow):
         self._init_img_dims = list(init_img_dims or [{} for _ in self._init_img_ids])
         self._document_ids = list(document_ids or [])
         return await self.run(prompt=prompt)
+
+
+# ── Flash-fallback helpers (общие для brand_t2i / brand_i2i / who_is_who) ──
+def is_transient_gemini_failure(job: GenerationJob) -> bool:
+    """True если Phygital вернул transient-error (status=error / 504 / server error),
+    при котором имеет смысл повторить с Flash-моделью.
+
+    НЕ срабатывает на:
+      - completed (никаких retry'ев не нужно);
+      - 'cannot upload files' (это stale-doc, обрабатывается в brand-композерах
+        отдельной веткой переаплоада).
+    """
+    if job.status == "completed":
+        return False
+    err = (job.error or "").lower()
+    if "cannot upload files" in err:
+        return False
+    return (
+        "status=error" in err
+        or "504" in err
+        or "gateway timeout" in err
+        or "server error" in err
+    )
+
+
+async def run_text_with_flash_fallback(
+    client: PhygitalClient,
+    *,
+    prompt: str,
+    document_ids: list[int] | None = None,
+    init_img_ids: list[int] | None = None,
+    init_img_dims: list[dict[str, int]] | None = None,
+    on_progress: ProgressCallback | None = None,
+) -> GenerationJob:
+    """Запустить Gemini Text с авто-fallback на Flash при transient-сбоях сервера.
+
+    Первый прогон: pro_3_1 + thinking_level=high (рабочая комбинация brand-сценариев).
+    Если submit_task поднимает HTTPStatusError 504 ИЛИ задача завершилась с
+    status=error / 504 / server error — повторяем один раз с flash_3 + thinking=low.
+
+    Stale-doc ('Cannot upload files') в fallback НЕ попадает: эта ошибка
+    обрабатывается выше по стеку (invalidate cache + переаплоад документа).
+    """
+    async def _attempt(model: str, thinking: str) -> GenerationJob:
+        wf = GeminiTextWorkflow(client, model=model, thinking_level=thinking)
+        wf.on_progress = on_progress
+        return await wf.run_text(
+            prompt=prompt,
+            init_img_ids=init_img_ids or [],
+            init_img_dims=init_img_dims or [],
+            document_ids=document_ids or [],
+        )
+
+    try:
+        job = await _attempt("pro_3_1", "high")
+    except httpx.HTTPStatusError as e:
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        if code != 504:
+            raise
+        logger.warning(
+            "[gemini-fallback] pro_3_1 raised HTTPStatusError 504 on submit; "
+            "retrying with flash_3/low"
+        )
+        return await _attempt("flash_3", "low")
+
+    if is_transient_gemini_failure(job):
+        logger.warning(
+            f"[gemini-fallback] pro_3_1 transient failure ({job.error!r}); "
+            f"retrying with flash_3/low"
+        )
+        return await _attempt("flash_3", "low")
+    return job

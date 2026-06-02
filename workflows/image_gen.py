@@ -44,6 +44,8 @@ class ImageGenWorkflow(Workflow):
     """
 
     workflow_id = str(WORKFLOW_SCHEMA_ID)
+    # Nano Banana — медиана ~37s по логам (см. ETA_NANO_BANANA_SEC=45 в scenarios.py).
+    EXPECTED_DURATION_S = 45.0
 
     def __init__(
         self,
@@ -188,15 +190,29 @@ class ImageGenWorkflow(Workflow):
         poll_interval: float = 1.5,
     ) -> GenerationJob:
         task_id = int(job_id)
-        deadline = asyncio.get_event_loop().time() + timeout
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
         last_status: str | None = None
+        last_progress: float | None = None
+        running_started_at: float | None = None
 
-        while asyncio.get_event_loop().time() < deadline:
+        while loop.time() < deadline:
             data = await self.client.task_status(task_id)
             status = (data.get("status") or "").lower()
             if status != last_status:
                 logger.info(f"task {task_id}: {status} (position={data.get('position')}, progress={data.get('progress')})")
                 last_status = status
+
+            # Progress reporting — приоритет реальному значению, иначе synth по elapsed.
+            if status in ("running", "in_progress"):
+                if running_started_at is None:
+                    running_started_at = loop.time()
+                raw = data.get("progress")
+                if raw is not None:
+                    last_progress = await self._emit_progress(raw, last_progress)
+                else:
+                    synth = self._synth_progress(running_started_at, loop.time())
+                    last_progress = await self._push_progress(synth, last_progress)
 
             if status in DONE_STATUSES:
                 link_ids = self._extract_link_ids(data.get("outputs") or [])

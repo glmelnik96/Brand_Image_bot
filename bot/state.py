@@ -77,13 +77,22 @@ class TaskRecipe:
       task_uid     — короткий uid задачи (тот же, что в `bot/tmp/<uid>/<task_uid>/`).
       user_id      — кто запускал; нужно для regen_dir и проверок ownership.
       label        — человекочитаемая метка задачи (та же, что в чате).
-      workflow     — тип workflow: 'nb_t2i' | 'nb_i2i' | 'brand_t2i' | 'brand_i2i' | 'speaker'.
+      workflow     — тип workflow: 'nb_t2i' | 'nb_i2i' | 'brand_t2i' | 'brand_i2i' | 'speaker'
+                     | 'speaker_bg' | 'speaker_nobg' | 'wiw_imagine' | 'mj_upscale' | 'mj_variation'.
       prompt       — финальный промпт (для speaker — собран из speaker_prompt(gender)).
+                     Для MJ-сценариев — текст после Gemini Flash (для логов и повторов).
       params       — все параметры пикеров: model/ratio/resolution/quality/aspect/bg/gender.
       init_paths   — пути в regen_cache (копии файлов, переданных в Phygital как init).
                      Для t2i — пустой список.
       result_path  — путь к скачанной первой картинке-результату в regen_cache.
                      None если результат пока не успели сохранить.
+      result_paths — все скачанные картинки задачи (для MJ-сценариев — 4 шт.).
+                     Для одно-картиночных задач совпадает с [result_path] или пуст.
+      mj_task_id   — task_id Midjourney /imagine, на котором сделан этот grid. Нужен,
+                     чтобы U1-U4/V1-V4-кнопки могли сослаться на нужный from_task_id.
+                     Только для wiw_imagine / mj_variation (тоже отдаёт grid).
+      parent_task_uid — uid bot-задачи, из которой родилась эта (U/V → wiw_imagine).
+                       Помогает обратной навигации/логированию.
       created_at   — time.time() момента сохранения recipe.
     """
 
@@ -95,6 +104,9 @@ class TaskRecipe:
     params: dict
     init_paths: list[Path] = field(default_factory=list)
     result_path: Optional[Path] = None
+    result_paths: list[Path] = field(default_factory=list)
+    mj_task_id: Optional[int] = None
+    parent_task_uid: Optional[str] = None
     created_at: float = field(default_factory=time.time)
 
     def age_sec(self) -> float:

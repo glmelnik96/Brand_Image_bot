@@ -46,6 +46,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputFile,
+    InputMediaPhoto,
     Message,
     Update,
 )
@@ -72,6 +73,9 @@ from workflows.brand_img2img import run_brand_img2img
 from workflows.brand_text2img import run_brand_text2img
 from workflows.image_gen import ImageGenWorkflow
 from workflows.image_to_image import ImageToImageWorkflow
+from workflows.midjourney import MJUpscaleWorkflow, MJVariationWorkflow
+from workflows.photoroom import PhotoroomBgRemoveWorkflow
+from workflows.who_is_who import run_who_is_who
 from workflows.speaker_prep import (
     BG_COLORS,
     DEFAULT_REFERENCE,
@@ -93,6 +97,11 @@ BT2I_PROMPT, BT2I_RATIO, BT2I_RES = range(30, 33)
 # /brand_img2img: collect (1-4) → /done → ratio → resolution. Пользователь НЕ пишет промпт —
 # Gemini Text запускается с фикс. text_prompt="Read the System Prompt" + system-prompt-документом.
 BI2I_COLLECT, BI2I_RATIO, BI2I_RES = range(40, 43)
+# Who is who: prompt → MJ Imagine (через Gemini Flash). Видим только UID из WIW_UIDS.
+WIW_PROMPT_STATE, = range(50, 51)
+
+# Who is who — внутренний/exper-ный сценарий, видим в главном меню только этим UID.
+WIW_UIDS: frozenset[int] = frozenset({820187903, 438074662})
 
 TG_PHOTO_LIMIT_BYTES = 10 * 1024 * 1024
 
@@ -101,6 +110,13 @@ TG_PHOTO_LIMIT_BYTES = 10 * 1024 * 1024
 ETA_NANO_BANANA_SEC = 45
 # Brand-сценарии = два последовательных task'а (Gemini Text ~25–40s + Nano Banana ~30–60s).
 ETA_BRAND_SEC = 90
+# Photoroom (удаление фона) — быстрая нода, по UI ~5–15s.
+ETA_PHOTOROOM_SEC = 20
+# Who is who = Gemini Flash (короткий ~10-25s) + MJ Imagine (~60-120s).
+ETA_WIW_SEC = 120
+# MJ Upscale / Variation — без Gemini, отдельные ноды Midjourney.
+ETA_MJ_UPSCALE_SEC = 40
+ETA_MJ_VARIATION_SEC = 70
 
 # Фиксированный вариант модели Nano Banana — Phygital поддерживает v2/v2.5/v3/v3.1,
 # боту оставили только v3.1 (Pro), чтобы убрать лишний шаг пикера.
@@ -212,10 +228,47 @@ def _action_keyboard(task_uid: str, *, workflow: str = "nb_t2i") -> InlineKeyboa
         rows.append(color_btns[:3])
         if color_btns[3:]:
             rows.append(color_btns[3:])
+        rows.append([
+            InlineKeyboardButton("Удалить фон", callback_data=f"spkrrmbg:{task_uid}")
+        ])
+    elif workflow == "speaker_nobg":
+        # После удаления фона — оставляем только повторное удаление (рекурсивно,
+        # вдруг результат не понравился — можно прогнать ещё раз тот же исходник).
+        rows.append([
+            InlineKeyboardButton("Удалить фон ещё раз", callback_data=f"spkrrmbg:{task_uid}")
+        ])
+    elif workflow == "mj_upscale":
+        # Upscale — финальная картинка, дальше U/V не нужны.
+        pass
+    # mj_variation / wiw_imagine рендерятся через _send_mj_grid_with_actions
+    # (media_group + follow-up с U/V), сюда не попадают.
     # nb_i2i / brand_i2i — только «Повторить»
     # 👍/👎 — последняя строка для всех сценариев.
     rows.append(rating_kb(task_uid, workflow))
     return InlineKeyboardMarkup(rows)
+
+
+def _mj_grid_actions_kb(task_uid: str, workflow: str = "wiw_imagine") -> InlineKeyboardMarkup:
+    """Кнопки под grid'ом из 4 MJ-картинок: U1-U4 (Upscale), V1-V4 (Variation),
+    плюс «Повторить» и оценка 👍/👎. Колбэки:
+      mjact:U:<task_uid>:<idx>  — Upscale картинки idx ∈ 1..4
+      mjact:V:<task_uid>:<idx>  — Variation картинки idx ∈ 1..4
+      regen:<task_uid>          — повторить исходную задачу с новой сидой
+    """
+    u_row = [
+        InlineKeyboardButton(f"U{i}", callback_data=f"mjact:U:{task_uid}:{i}")
+        for i in range(1, 5)
+    ]
+    v_row = [
+        InlineKeyboardButton(f"V{i}", callback_data=f"mjact:V:{task_uid}:{i}")
+        for i in range(1, 5)
+    ]
+    return InlineKeyboardMarkup([
+        u_row,
+        v_row,
+        [InlineKeyboardButton("Повторить", callback_data=f"regen:{task_uid}")],
+        rating_kb(task_uid, workflow),
+    ])
 
 
 # ── главное меню и подменю ─────────────────────────────────────────────────
@@ -225,14 +278,26 @@ def _action_keyboard(task_uid: str, *, workflow: str = "nb_t2i") -> InlineKeyboa
 #        → edit → {img2img, brand_img2img}
 #        → prep_speaker
 #        → help
-def _menu_root_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+def _menu_root_kb_for(uid: int | None = None) -> InlineKeyboardMarkup:
+    """Главное меню. Для UID из WIW_UIDS добавляется кнопка «Who is who»
+    (экспериментальный MJ-сценарий, остальным не показываем)."""
+    rows: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton("Создай изображение", callback_data="menu:make")],
         [InlineKeyboardButton("Изменить изображение", callback_data="menu:edit")],
         [InlineKeyboardButton("Фотография спикера", callback_data="menu:prep_speaker")],
+    ]
+    if uid is not None and uid in WIW_UIDS:
+        rows.append([InlineKeyboardButton("Who is who", callback_data="menu:wiw")])
+    rows.extend([
         [InlineKeyboardButton("Обратная связь", callback_data="menu:feedback")],
         [InlineKeyboardButton("Помощь", callback_data="menu:help")],
     ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _menu_root_kb() -> InlineKeyboardMarkup:
+    """Backward-compat alias — без UID-инфы, без Who-is-who-кнопки."""
+    return _menu_root_kb_for(None)
 
 
 def _menu_make_kb() -> InlineKeyboardMarkup:
@@ -322,7 +387,15 @@ _FIRST_STEP_BY_WORKFLOW: dict[str, str] = {
     "brand_i2i": "Gemini Text",
     "speaker": "Nano Banana",
     "speaker_bg": "Nano Banana",
+    "speaker_nobg": "Photoroom",
+    "wiw_imagine": "Gemini Flash",
+    "mj_upscale": "MJ Upscale",
+    "mj_variation": "MJ Variation",
 }
+
+# Сценарии, чьи result_urls приходят grid-ом из 4 картинок и должны рендериться
+# как media_group + follow-up с кнопками U1-U4/V1-V4.
+_MJ_GRID_WORKFLOWS: frozenset[str] = frozenset({"wiw_imagine", "mj_variation"})
 
 
 def _initial_step_for(recipe_template: TaskRecipe | None) -> str:
@@ -426,7 +499,7 @@ async def _execute_task(
             await reporter.start(first_step)
             run_started = time.monotonic()
 
-            job = await runner(progress_cb=reporter.step)
+            job = await runner(progress_cb=reporter.step, pct_cb=reporter.progress)
             gen_dur = time.monotonic() - run_started
 
         log = log.bind(job_id=job.job_id)
@@ -436,26 +509,58 @@ async def _execute_task(
 
         if job.status == "completed" and job.result_urls:
             await reporter.done(job_id=str(job.job_id))
-            # Скачиваем + отправляем каждую картинку; ловим путь к первой для regen-cache.
-            first_result_local: Path | None = None
             workflow_for_kb = recipe_template.workflow if recipe_template else "nb_t2i"
-            for i, url in enumerate(job.result_urls, 1):
-                local = await _send_result_image(
-                    chat=chat, log=log, url=url, uid=uid, task_uid=task_uid,
-                    idx=i, total=len(job.result_urls),
-                    with_action_kb=(i == 1 and recipe_template is not None),
-                    action_task_uid=task_uid,
-                    action_workflow=workflow_for_kb,
+            send_as_document = workflow_for_kb == "speaker_nobg"
+            first_result_local: Path | None = None
+            all_results_local: list[Path] = []
+
+            if workflow_for_kb in _MJ_GRID_WORKFLOWS:
+                # MJ grid (wiw_imagine / mj_variation): media_group из 4 картинок + follow-up
+                # с U1-U4/V1-V4 кнопками. Telegram не позволяет inline-кнопки на media_group,
+                # поэтому follow-up — отдельным сообщением.
+                all_results_local = await _send_mj_grid_with_actions(
+                    chat=chat, log=log, urls=job.result_urls, uid=uid,
+                    task_uid=task_uid, workflow=workflow_for_kb,
                 )
-                if i == 1 and local is not None:
-                    first_result_local = local
+                if all_results_local:
+                    first_result_local = all_results_local[0]
+            else:
+                # Скачиваем + отправляем каждую картинку; ловим путь к первой для regen-cache.
+                for i, url in enumerate(job.result_urls, 1):
+                    local = await _send_result_image(
+                        chat=chat, log=log, url=url, uid=uid, task_uid=task_uid,
+                        idx=i, total=len(job.result_urls),
+                        with_action_kb=(i == 1 and recipe_template is not None),
+                        action_task_uid=task_uid,
+                        action_workflow=workflow_for_kb,
+                        as_document=send_as_document,
+                    )
+                    if i == 1 and local is not None:
+                        first_result_local = local
+                    if local is not None:
+                        all_results_local.append(local)
+
+            # mj_task_id — нужен для U/V-кнопок над grid'ом (см. mjact_cb).
+            # Для wiw_imagine он лежит в job.raw["mj_task_id"], для mj_variation —
+            # task_id её самой (она тоже отдаёт grid).
+            mj_task_id: int | None = None
+            if workflow_for_kb in _MJ_GRID_WORKFLOWS:
+                raw_mj = (job.raw or {}).get("mj_task_id")
+                if isinstance(raw_mj, int):
+                    mj_task_id = raw_mj
+                else:
+                    try:
+                        mj_task_id = int(job.job_id)
+                    except (TypeError, ValueError):
+                        mj_task_id = None
 
             # Сохраняем recipe (если был template) — после отправки картинки.
             if recipe_template is not None:
                 try:
                     _persist_recipe(
                         state=state, template=recipe_template, task_uid=task_uid,
-                        cleanup_paths=cleanup_paths, first_result=first_result_local, log=log,
+                        cleanup_paths=cleanup_paths, first_result=first_result_local,
+                        all_results=all_results_local, mj_task_id=mj_task_id, log=log,
                     )
                 except Exception as e:
                     log.opt(exception=e).warning(f"recipe save failed: {e!r}")
@@ -496,10 +601,14 @@ def _persist_recipe(
     task_uid: str,
     cleanup_paths: list[Path],
     first_result: Path | None,
+    all_results: list[Path] | None = None,
+    mj_task_id: int | None = None,
     log,
 ) -> None:
     """Завершает заготовку recipe и кладёт её в state.recipes.
-    Копирует init-файлы (cleanup_paths) в regen_dir, чтобы они пережили cleanup."""
+    Копирует init-файлы (cleanup_paths) в regen_dir, чтобы они пережили cleanup.
+    `all_results` — список всех скачанных картинок (для MJ grid'ов из 4 шт.).
+    `mj_task_id` — int task_id MJ Imagine/Variation, нужен для U/V кнопок."""
     regen_dir = state.regen_dir(template.user_id, task_uid)
     cached_inits: list[Path] = []
     for i, p in enumerate(cleanup_paths, 1):
@@ -518,18 +627,103 @@ def _persist_recipe(
         task_uid=task_uid,
         init_paths=cached_inits,
         result_path=first_result,
+        result_paths=list(all_results or ([first_result] if first_result else [])),
+        mj_task_id=mj_task_id,
     )
     state.save_recipe(recipe)
     log.info(
         f"recipe saved: workflow={recipe.workflow} inits={len(cached_inits)} "
+        f"results={len(recipe.result_paths)} mj_task_id={mj_task_id} "
         f"has_result={first_result is not None}"
     )
+
+
+async def _send_mj_grid_with_actions(
+    *, chat: Chat, log, urls: list[str], uid: int, task_uid: str,
+    workflow: str,
+) -> list[Path]:
+    """Скачивает все картинки grid'а в regen_dir, шлёт media_group, затем follow-up
+    с U1-U4/V1-V4 кнопками. Возвращает список локальных путей (в порядке urls).
+
+    Telegram media_group не поддерживает inline-кнопки, поэтому follow-up — отдельным
+    text-сообщением с _mj_grid_actions_kb. Сообщение не несёт картинки — только
+    короткий текст «Готово, выбери U/V» + клавиатура.
+    """
+    state = get_state()
+    regen_dir = state.regen_dir(uid, task_uid)
+    locals_: list[Path] = []
+    for i, url in enumerate(urls, 1):
+        local = regen_dir / f"result_{i}.png"
+        try:
+            async with httpx.AsyncClient(timeout=120, follow_redirects=True, verify=_SSL_CTX) as cli:
+                r = await cli.get(url)
+                r.raise_for_status()
+                local.write_bytes(r.content)
+            locals_.append(local)
+            log.info(
+                f"mj-grid: downloaded {i}/{len(urls)} → {local.name} "
+                f"({local.stat().st_size / 1024 / 1024:.2f}MB)"
+            )
+        except Exception as e:
+            log.warning(f"mj-grid: download {i}/{len(urls)} failed: {type(e).__name__}: {e}")
+
+    if not locals_:
+        # Ничего не скачали — пробуем сырыми URL'ами через media_group.
+        try:
+            media = [InputMediaPhoto(media=u) for u in urls[:10]]
+            await chat.send_media_group(media=media)
+            log.info("mj-grid: sent media_group via raw urls (no local copies)")
+        except Exception as e:
+            log.warning(f"mj-grid: raw-url media_group failed: {type(e).__name__}: {e}")
+            for u in urls:
+                try:
+                    await chat.send_message(f"Картинка: {u}")
+                except Exception:
+                    pass
+    else:
+        try:
+            opened = []
+            files = []
+            for p in locals_:
+                fh = p.open("rb")
+                files.append(fh)
+                opened.append(InputMediaPhoto(media=InputFile(fh, filename=p.name)))
+            try:
+                await chat.send_media_group(media=opened)
+                log.info(f"mj-grid: sent media_group of {len(opened)} photos")
+            finally:
+                for fh in files:
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.warning(f"mj-grid: media_group send failed: {type(e).__name__}: {e}")
+            # Fallback — по одной картинке.
+            for i, p in enumerate(locals_, 1):
+                try:
+                    with p.open("rb") as fh:
+                        await chat.send_photo(photo=InputFile(fh, filename=p.name))
+                except Exception as ee:
+                    log.warning(f"mj-grid: fallback photo {i} failed: {ee!r}")
+
+    # Follow-up с U/V кнопками.
+    try:
+        await chat.send_message(
+            "Готово. Выбери действие над одной из четырёх:\n"
+            "U1-U4 — улучшить (Upscale), V1-V4 — сделать вариации.",
+            reply_markup=_mj_grid_actions_kb(task_uid, workflow=workflow),
+        )
+    except Exception as e:
+        log.warning(f"mj-grid: follow-up keyboard failed: {type(e).__name__}: {e}")
+    return locals_
 
 
 async def _send_result_image(
     *, chat: Chat, log, url: str, uid: int, task_uid: str, idx: int, total: int,
     with_action_kb: bool = False, action_task_uid: str | None = None,
     action_workflow: str = "nb_t2i",
+    as_document: bool = False,
 ) -> Path | None:
     """Скачивает result-картинку и отправляет в чат. Возвращает локальный путь (для regen_cache).
 
@@ -559,7 +753,9 @@ async def _send_result_image(
 
     # Если нужны кнопки + локальный путь (для asi2i) — пропускаем url-стратегию,
     # сразу качаем и шлём upload. Иначе оптимизируем под скорость и пробуем url первым.
-    if not with_action_kb:
+    # Если as_document=True (например, PNG с прозрачностью после Photoroom) — тоже всегда
+    # качаем и шлём через send_document, иначе Telegram пожмёт в JPEG и убьёт alpha.
+    if not with_action_kb and not as_document:
         try:
             await chat.send_photo(url)
             log.info(f"sent {idx}/{total} via url")
@@ -584,9 +780,12 @@ async def _send_result_image(
         )
         with local.open("rb") as fh:
             inp = InputFile(fh, filename=local.name)
-            if size > TG_PHOTO_LIMIT_BYTES:
+            if as_document or size > TG_PHOTO_LIMIT_BYTES:
                 await chat.send_document(document=inp, reply_markup=kb)
-                log.info(f"sent {idx}/{total} as document (size>10MB)")
+                log.info(
+                    f"sent {idx}/{total} as document "
+                    f"({'forced' if as_document else 'size>10MB'})"
+                )
             else:
                 await chat.send_photo(photo=inp, reply_markup=kb)
                 log.info(f"sent {idx}/{total} as photo upload")
@@ -709,11 +908,12 @@ async def _gen_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
     chat = update.effective_chat
 
-    async def runner(progress_cb=None) -> GenerationJob:
+    async def runner(progress_cb=None, pct_cb=None) -> GenerationJob:
         async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
             wf = ImageGenWorkflow(
                 client, model_name=model, ratio=ratio, resolution=resolution
             )
+            wf.on_progress = pct_cb
             return await wf.run(prompt=prompt)
 
     template = TaskRecipe(
@@ -842,11 +1042,12 @@ async def i2i_res(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     u = update.effective_user
     chat = update.effective_chat
 
-    async def runner(progress_cb=None) -> GenerationJob:
+    async def runner(progress_cb=None, pct_cb=None) -> GenerationJob:
         async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
             wf = ImageToImageWorkflow(
                 client, model_name=model, ratio=ratio, resolution=resolution
             )
+            wf.on_progress = pct_cb
             return await wf.run_with_files(prompt=prompt, init_paths=init_paths)
 
     template = TaskRecipe(
@@ -970,12 +1171,13 @@ async def sp_res(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     u = update.effective_user
     chat = update.effective_chat
 
-    async def runner(progress_cb=None) -> GenerationJob:
+    async def runner(progress_cb=None, pct_cb=None) -> GenerationJob:
         async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
             wf = build_speaker_prep_workflow(client)
             # Перебиваем дефолтные параметры выбором пользователя.
             wf.ratio = ratio
             wf.resolution = resolution
+            wf.on_progress = pct_cb
             return await wf.run_with_files(
                 prompt=prompt, init_paths=[DEFAULT_REFERENCE, photo]
             )
@@ -1103,11 +1305,12 @@ async def _bt2i_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
     chat = update.effective_chat
 
-    async def runner(progress_cb=None) -> GenerationJob:
+    async def runner(progress_cb=None, pct_cb=None) -> GenerationJob:
         async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
             return await run_brand_text2img(
                 client, prompt=prompt, variant=variant, model_name=model,
-                ratio=ratio, resolution=resolution, progress_cb=progress_cb,
+                ratio=ratio, resolution=resolution,
+                progress_cb=progress_cb, pct_cb=pct_cb,
             )
 
     label = f"brand_t2i:{variant}/{model}/{ratio}/{resolution}"
@@ -1223,12 +1426,12 @@ async def bi2i_res(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     u = update.effective_user
     chat = update.effective_chat
 
-    async def runner(progress_cb=None) -> GenerationJob:
+    async def runner(progress_cb=None, pct_cb=None) -> GenerationJob:
         async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
             return await run_brand_img2img(
                 client, init_paths=init_paths,
                 model_name=model, ratio=ratio, resolution=resolution,
-                progress_cb=progress_cb,
+                progress_cb=progress_cb, pct_cb=pct_cb,
             )
 
     # prompt в recipe — пустая строка: пользовательского текста нет, фикс. "Read the System Prompt"
@@ -1251,6 +1454,87 @@ async def bi2i_res(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         recipe_template=template,
     )
     return ConversationHandler.END
+
+
+# ── Who is who (Gemini Flash → MJ Imagine) ─────────────────────────────────
+# Видим в меню только UID из WIW_UIDS. Пользователь шлёт свободный текст,
+# Gemini Flash переписывает по WhoIsWho-промпту, MJ Imagine рисует 4 картинки.
+# Под grid'ом — U1-U4 / V1-V4 кнопки + «Повторить» + 👍/👎.
+@whitelist_only
+async def wiw_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id if update.effective_user else 0
+    if uid not in WIW_UIDS:
+        # Хотя кнопка и не показывается, защитимся от ручного вызова callback'а.
+        _ulog(update, "wiw").warning(f"deny WIW for uid={uid} (not in whitelist)")
+        if update.callback_query:
+            try:
+                await update.callback_query.answer("Недоступно.")
+            except Exception:
+                pass
+        return ConversationHandler.END
+    if not await _check_user_capacity(update):
+        return ConversationHandler.END
+    if update.callback_query:
+        try:
+            await update.callback_query.answer()
+        except Exception:
+            pass
+    _ulog(update, "wiw").info("entered prompt-collection state")
+    target = _first_message(update)
+    await target.reply_text(
+        "Пришли набор словосочетаний для Who is who.\n"
+        "/cancel — выйти."
+    )
+    return WIW_PROMPT_STATE
+
+
+@whitelist_only
+async def wiw_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    log = _ulog(update, "wiw")
+    uid = update.effective_user.id if update.effective_user else 0
+    if uid not in WIW_UIDS:
+        log.warning(f"deny WIW prompt for uid={uid}")
+        return ConversationHandler.END
+    prompt = (update.message.text or "").strip()
+    if not prompt:
+        log.warning("empty prompt, asking again")
+        await update.message.reply_text(
+            "Пустое описание. Пришли текст ещё раз или /cancel."
+        )
+        return WIW_PROMPT_STATE
+    log.info(f"prompt received: chars={len(prompt)} prompt={_escape_prompt(prompt)!r}; launching")
+    await _wiw_run(update, ctx, prompt)
+    return ConversationHandler.END
+
+
+async def _wiw_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str) -> None:
+    state = get_state()
+    u = update.effective_user
+    chat = update.effective_chat
+
+    async def runner(progress_cb=None, pct_cb=None) -> GenerationJob:
+        async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
+            return await run_who_is_who(
+                client, prompt=prompt,
+                progress_cb=progress_cb, pct_cb=pct_cb,
+            )
+
+    label = "who-is-who"
+    template = TaskRecipe(
+        task_uid="", user_id=u.id, label=label,
+        workflow="wiw_imagine", prompt=prompt,
+        params={},
+    )
+    await _enqueue_task(
+        ctx=ctx,
+        uid=u.id,
+        uname=u.username or u.full_name or "?",
+        chat=chat,
+        runner=runner,
+        label=label,
+        eta_sec=ETA_WIW_SEC,
+        recipe_template=template,
+    )
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -1297,9 +1581,10 @@ async def _download_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE, log) -
 async def cmd_menu(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Показать главное меню inline-кнопками."""
     _ulog(update, "/menu").info("menu opened")
+    uid = update.effective_user.id if update.effective_user else None
     await update.message.reply_text(
         "Главное меню. Выбери, что сделать:",
-        reply_markup=MENU_KEYBOARD,
+        reply_markup=_menu_root_kb_for(uid),
     )
 
 
@@ -1313,9 +1598,10 @@ async def menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     action = q.data.split(":", 1)[1]
     await q.answer()
     if action == "root":
+        uid = update.effective_user.id if update.effective_user else None
         await q.edit_message_text(
             "Главное меню. Выбери, что сделать:",
-            reply_markup=_menu_root_kb(),
+            reply_markup=_menu_root_kb_for(uid),
         )
     elif action == "make":
         await q.edit_message_text(
@@ -1552,11 +1838,12 @@ async def speaker_bg_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"ratio={ratio} res={resolution}"
     )
 
-    async def runner(progress_cb=None) -> GenerationJob:
+    async def runner(progress_cb=None, pct_cb=None) -> GenerationJob:
         async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
             wf = ImageToImageWorkflow(
                 client, model_name=model, ratio=ratio, resolution=resolution
             )
+            wf.on_progress = pct_cb
             return await wf.run_with_files(prompt=prompt, init_paths=[src_copy])
 
     template = TaskRecipe(
@@ -1579,6 +1866,162 @@ async def speaker_bg_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         label=f"speaker-bg/{color_name}",
         eta_sec=ETA_NANO_BANANA_SEC,
         cleanup_paths=[src_copy],
+        recipe_template=template,
+    )
+
+
+# ── удаление фона у портрета спикера (Photoroom) ──────────────────────────
+# spkrrmbg:<task_uid> — берём result_path исходной задачи (portrait / speaker_bg /
+# даже speaker_nobg для повторного прогона) и отдаём в Photoroom-ноду.
+# Результат — PNG с alpha, отправляем send_document'ом (через as_document=True),
+# чтобы Telegram не пожал в JPEG. recipe.workflow="speaker_nobg" → под результатом
+# одна кнопка «Удалить фон ещё раз» (см. _action_keyboard).
+@whitelist_only
+async def speaker_rmbg_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    parts = (q.data or "").split(":")
+    if len(parts) != 2:
+        await q.answer("Неверный формат кнопки.")
+        return
+    _, task_uid = parts
+
+    state = get_state()
+    recipe = state.get_recipe(task_uid)
+    if recipe is None:
+        await q.answer("Картинка устарела или не сохранилась локально.")
+        return
+
+    # Какую картинку прогонять через Photoroom?
+    #   - speaker / speaker_bg → result_path (исходный портрет / портрет с цветным фоном)
+    #   - speaker_nobg ("ещё раз") → init_paths[0] (тот же src, что был в прошлый раз),
+    #     иначе повторно гнали бы уже-без-фона PNG и получали бы то же самое.
+    if recipe.workflow == "speaker_nobg" and recipe.init_paths:
+        src_for_photoroom = recipe.init_paths[0]
+    elif recipe.result_path is not None:
+        src_for_photoroom = recipe.result_path
+    else:
+        await q.answer("Картинка устарела или не сохранилась локально.")
+        return
+    if not src_for_photoroom.exists():
+        await q.answer("Картинка устарела или не сохранилась локально.")
+        return
+
+    if not await _check_user_capacity_cb(update):
+        await q.answer()
+        return
+    await q.answer("Удаляю фон…")
+
+    u = update.effective_user
+    chat = update.effective_chat
+    uid = u.id
+    user_tmp = state.user_tmp(uid)
+    suffix = src_for_photoroom.suffix or ".png"
+    src_copy = user_tmp / f"spkrrmbg_{int(time.time() * 1000)}{suffix}"
+    try:
+        shutil.copyfile(src_for_photoroom, src_copy)
+    except Exception as e:
+        _ulog(update, "spkrrmbg").warning(f"copy src failed: {e!r}")
+        await chat.send_message("Не смог подготовить картинку. Попробуй ещё раз.")
+        return
+
+    _ulog(update, "spkrrmbg").info(f"from task={task_uid} → photoroom")
+
+    async def runner(progress_cb=None, pct_cb=None) -> GenerationJob:
+        async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
+            wf = PhotoroomBgRemoveWorkflow(client)
+            wf.on_progress = pct_cb
+            return await wf.run_with_file(init_path=src_copy)
+
+    template = TaskRecipe(
+        task_uid="", user_id=uid,
+        label="speaker-nobg",
+        workflow="speaker_nobg", prompt="",
+        params={"source_task_uid": task_uid},
+    )
+    await _enqueue_task(
+        ctx=ctx,
+        uid=uid,
+        uname=u.username or u.full_name or "?",
+        chat=chat,
+        runner=runner,
+        label="speaker / удалить фон",
+        eta_sec=ETA_PHOTOROOM_SEC,
+        cleanup_paths=[src_copy],
+        recipe_template=template,
+    )
+
+
+@whitelist_only
+async def mjact_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """U1-U4 / V1-V4 — Upscale или Variation одной из 4-х картинок MJ-grid'а.
+
+    Callback: `mjact:<U|V>:<task_uid>:<idx>`, где idx ∈ 1..4.
+    Берём `recipe.mj_task_id` (он сохранён в _execute_task для wiw_imagine /
+    mj_variation) и кидаем `MJUpscaleWorkflow` или `MJVariationWorkflow` с
+    `from_task_id=recipe.mj_task_id`, `image_num=idx`.
+    """
+    q = update.callback_query
+    parts = q.data.split(":")
+    if len(parts) != 4 or parts[1] not in ("U", "V"):
+        await q.answer("Кнопка устарела.")
+        return
+    op = parts[1]
+    task_uid = parts[2]
+    try:
+        idx = int(parts[3])
+    except ValueError:
+        await q.answer("Кнопка устарела.")
+        return
+    if not 1 <= idx <= 4:
+        await q.answer("Кнопка устарела.")
+        return
+
+    state = get_state()
+    recipe = state.get_recipe(task_uid)
+    if recipe is None or recipe.mj_task_id is None:
+        await q.answer("Параметры устарели (старше 24 часов).")
+        return
+    if not await _check_user_capacity_cb(update):
+        await q.answer()
+        return
+
+    u = update.effective_user
+    chat = update.effective_chat
+    mj_task_id = int(recipe.mj_task_id)
+    is_upscale = (op == "U")
+    label = f"mj-{'upscale' if is_upscale else 'variation'} {op}{idx}"
+    new_workflow = "mj_upscale" if is_upscale else "mj_variation"
+    eta = ETA_MJ_UPSCALE_SEC if is_upscale else ETA_MJ_VARIATION_SEC
+
+    await q.answer(f"{op}{idx}: запускаю.")
+    _ulog(update, f"mj-{op.lower()}{idx}").info(
+        f"from task_uid={task_uid} mj_task_id={mj_task_id}"
+    )
+
+    async def runner(progress_cb=None, pct_cb=None) -> GenerationJob:
+        async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
+            if is_upscale:
+                wf = MJUpscaleWorkflow(client, from_task_id=mj_task_id, image_num=idx)
+            else:
+                wf = MJVariationWorkflow(client, from_task_id=mj_task_id, image_num=idx)
+            wf.on_progress = pct_cb
+            return await wf.run()
+
+    template = TaskRecipe(
+        task_uid="", user_id=u.id, label=label,
+        workflow=new_workflow,
+        prompt=recipe.prompt,
+        params={"image_num": idx, "from_mj_task_id": mj_task_id},
+        parent_task_uid=task_uid,
+    )
+    await _enqueue_task(
+        ctx=ctx,
+        uid=u.id,
+        uname=u.username or u.full_name or "?",
+        chat=chat,
+        runner=runner,
+        label=label,
+        eta_sec=eta,
         recipe_template=template,
     )
 
@@ -1607,10 +2050,11 @@ async def _rerun_from_recipe(
         ratio = params.get("ratio", "default")
         resolution = params.get("resolution", "default")
 
-        async def runner(progress_cb=None) -> GenerationJob:
+        async def runner(progress_cb=None, pct_cb=None) -> GenerationJob:
             async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
                 wf = ImageGenWorkflow(client, model_name=model, ratio=ratio, resolution=resolution)
-                return await wf.run(prompt=prompt)
+                wf.on_progress = pct_cb
+            return await wf.run(prompt=prompt)
 
         label = f"generate/{model}/{ratio}/{resolution}"
         eta = ETA_NANO_BANANA_SEC
@@ -1625,10 +2069,11 @@ async def _rerun_from_recipe(
         # потому что cleanup_paths их потом удалит после задачи.
         init_paths = _stage_inits_from_recipe(state, u.id, recipe)
 
-        async def runner(progress_cb=None) -> GenerationJob:
+        async def runner(progress_cb=None, pct_cb=None) -> GenerationJob:
             async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
                 wf = ImageToImageWorkflow(client, model_name=model, ratio=ratio, resolution=resolution)
-                return await wf.run_with_files(prompt=prompt, init_paths=init_paths)
+                wf.on_progress = pct_cb
+            return await wf.run_with_files(prompt=prompt, init_paths=init_paths)
 
         label = f"img2img/{model}/{ratio}/{resolution}"
         eta = ETA_NANO_BANANA_SEC
@@ -1641,12 +2086,12 @@ async def _rerun_from_recipe(
         resolution = params.get("resolution", "default")
         variant = params.get("variant", "photo")
 
-        async def runner(progress_cb=None) -> GenerationJob:
+        async def runner(progress_cb=None, pct_cb=None) -> GenerationJob:
             async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
                 return await run_brand_text2img(
                     client, prompt=prompt, variant=variant, model_name=model,
                     ratio=ratio, resolution=resolution,
-                    progress_cb=progress_cb,
+                    progress_cb=progress_cb, pct_cb=pct_cb,
                 )
 
         label = f"brand_t2i:{variant}/{model}/{ratio}/{resolution}"
@@ -1664,12 +2109,12 @@ async def _rerun_from_recipe(
             await chat.send_message("Не нашёл локальной копии исходников для повтора.")
             return
 
-        async def runner(progress_cb=None) -> GenerationJob:
+        async def runner(progress_cb=None, pct_cb=None) -> GenerationJob:
             async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
                 return await run_brand_img2img(
                     client, init_paths=init_paths,
                     model_name=model, ratio=ratio, resolution=resolution,
-                    progress_cb=progress_cb,
+                    progress_cb=progress_cb, pct_cb=pct_cb,
                 )
 
         label = f"brand_i2i/{model}/{ratio}/{resolution}"
@@ -1691,12 +2136,13 @@ async def _rerun_from_recipe(
         # Если ✏️ Уточнить вызвал regen — prompt в recipe собран из speaker_prompt(gender);
         # юзерский override применяем как есть (он же и редактирует этот системный промпт).
 
-        async def runner(progress_cb=None) -> GenerationJob:
+        async def runner(progress_cb=None, pct_cb=None) -> GenerationJob:
             async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
                 wf = build_speaker_prep_workflow(client)
                 wf.ratio = ratio
                 wf.resolution = resolution
-                return await wf.run_with_files(
+                wf.on_progress = pct_cb
+            return await wf.run_with_files(
                     prompt=prompt, init_paths=[DEFAULT_REFERENCE, speaker_photo]
                 )
 
@@ -1716,18 +2162,86 @@ async def _rerun_from_recipe(
             await chat.send_message("Не нашёл локальной копии исходника для повтора.")
             return
 
-        async def runner(progress_cb=None) -> GenerationJob:
+        async def runner(progress_cb=None, pct_cb=None) -> GenerationJob:
             async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
                 wf = ImageToImageWorkflow(
                     client, model_name=model, ratio=ratio, resolution=resolution
                 )
-                return await wf.run_with_files(prompt=prompt, init_paths=init_paths)
+                wf.on_progress = pct_cb
+            return await wf.run_with_files(prompt=prompt, init_paths=init_paths)
 
         color_name = params.get("color_name", "bg")
         label = f"speaker-bg/{color_name}"
         eta = ETA_NANO_BANANA_SEC
         cleanup = list(init_paths)
         new_workflow = "speaker_bg"
+
+    elif recipe.workflow == "speaker_nobg":
+        # Повторяем удаление фона: используем тот же src (предыдущий result_path
+        # уже не годится — он PNG без фона). init_paths хранит исходник, который
+        # был отправлен в Photoroom первый раз.
+        init_paths = _stage_inits_from_recipe(state, u.id, recipe)
+        if not init_paths:
+            await chat.send_message("Не нашёл локальной копии исходника для повтора.")
+            return
+        src = init_paths[0]
+
+        async def runner(progress_cb=None, pct_cb=None) -> GenerationJob:
+            async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
+                wf = PhotoroomBgRemoveWorkflow(client)
+                wf.on_progress = pct_cb
+            return await wf.run_with_file(init_path=src)
+
+        label = "speaker-nobg"
+        eta = ETA_PHOTOROOM_SEC
+        cleanup = list(init_paths)
+        new_workflow = "speaker_nobg"
+
+    elif recipe.workflow == "wiw_imagine":
+        # Повторить Who is who — тот же user-prompt, новый прогон Gemini Flash + MJ
+        # (получим другую сидку — это и есть смысл «Повторить» под grid'ом).
+        async def runner(progress_cb=None, pct_cb=None) -> GenerationJob:
+            async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
+                return await run_who_is_who(
+                    client, prompt=prompt,
+                    progress_cb=progress_cb, pct_cb=pct_cb,
+                )
+
+        label = "who-is-who"
+        eta = ETA_WIW_SEC
+        cleanup = []
+        new_workflow = "wiw_imagine"
+
+    elif recipe.workflow in ("mj_upscale", "mj_variation"):
+        # Повторить U/V — нужен исходный mj_task_id из ПРЕДКА (parent_task_uid),
+        # потому что MJ child-ноды не цепляются к собственному task_id.
+        from_mj = (
+            recipe.params.get("from_mj_task_id")
+            if isinstance(recipe.params, dict) else None
+        )
+        image_num = (
+            recipe.params.get("image_num") if isinstance(recipe.params, dict) else None
+        )
+        if not isinstance(from_mj, int) or not isinstance(image_num, int):
+            await chat.send_message(
+                "Не нашёл параметров MJ-задачи для повтора (нет mj_task_id/image_num)."
+            )
+            return
+        is_upscale = recipe.workflow == "mj_upscale"
+
+        async def runner(progress_cb=None, pct_cb=None) -> GenerationJob:
+            async with PhygitalClient(state.session, session_manager=state.session_manager) as client:
+                if is_upscale:
+                    wf = MJUpscaleWorkflow(client, from_task_id=from_mj, image_num=image_num)
+                else:
+                    wf = MJVariationWorkflow(client, from_task_id=from_mj, image_num=image_num)
+                wf.on_progress = pct_cb
+                return await wf.run()
+
+        label = f"mj-{'upscale' if is_upscale else 'variation'} {('U' if is_upscale else 'V')}{image_num}"
+        eta = ETA_MJ_UPSCALE_SEC if is_upscale else ETA_MJ_VARIATION_SEC
+        cleanup = []
+        new_workflow = recipe.workflow
 
     else:
         await chat.send_message(
@@ -1868,7 +2382,24 @@ def build_conversations() -> list[ConversationHandler]:
         persistent=False,
     )
 
-    return [conv_generate, conv_img2img, conv_prep, conv_brand_t2i, conv_brand_i2i]
+    # Who is who — экспериментальный сценарий для UID из WIW_UIDS (см. wiw_start).
+    # Entry скрыт от других юзеров через _menu_root_kb_for, а wiw_start ещё раз
+    # проверяет UID на случай прямого вызова callback'а.
+    conv_wiw = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(wiw_start, pattern=r"^menu:wiw$"),
+        ],
+        states={
+            WIW_PROMPT_STATE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, wiw_prompt),
+            ],
+        },
+        fallbacks=cancel_handlers,
+        name="who_is_who",
+        persistent=False,
+    )
+
+    return [conv_generate, conv_img2img, conv_prep, conv_brand_t2i, conv_brand_i2i, conv_wiw]
 
 
 def build_extra_handlers() -> list:
@@ -1891,6 +2422,9 @@ def build_extra_handlers() -> list:
         ("group0", CallbackQueryHandler(regen_cb, pattern=r"^regen:")),
         ("group0", CallbackQueryHandler(edit_prompt_cb, pattern=r"^editp:")),
         ("group0", CallbackQueryHandler(speaker_bg_cb, pattern=r"^spkrbg:")),
+        ("group0", CallbackQueryHandler(speaker_rmbg_cb, pattern=r"^spkrrmbg:")),
+        # U1-U4 / V1-V4 под MJ-grid'ом (wiw_imagine, mj_variation).
+        ("group0", CallbackQueryHandler(mjact_cb, pattern=r"^mjact:")),
         # Подсистема обратной связи: menu:feedback + все fb:* callback'и + listener текста.
         *build_feedback_handlers(),
         # Глобальный listener в group=1 — после conversations.

@@ -41,11 +41,14 @@ from workflows.brand_docs import (
     get_text2img_doc,
     invalidate_brand_doc,
 )
-from workflows.gemini_text import GeminiTextWorkflow
+from workflows.base import ProgressCallback
+from workflows.gemini_text import GeminiTextWorkflow, run_text_with_flash_fallback  # GeminiTextWorkflow ещё нужен в _scrub_prompt
 from workflows.image_gen import ImageGenWorkflow
 
 # Callback для статус-апдейтов между шагами цепочки. None — молча работаем.
 ProgressCb = Optional[Callable[[str], Awaitable[None]]]
+# Callback для процента внутри одного этапа (0..1). None — молча работаем.
+PctCb = Optional[ProgressCallback]
 
 # Максимум попыток sanitize+retry, если Nano Banana подряд режет safety filter.
 # 2 — чтобы хватило на цепочку «отклонил A → почистили → отклонил B → почистили»,
@@ -127,12 +130,14 @@ async def run_brand_text2img(
     ratio: str = "default",
     resolution: str = "default",
     progress_cb: ProgressCb = None,
+    pct_cb: PctCb = None,
 ) -> GenerationJob:
     """Bind user-text → описание (Gemini c вариантным system-prompt) → картинка (Nano Banana)."""
     doc_id = await get_text2img_doc(client, variant)
     logger.info(f"[brand_t2i:{variant}] using system-prompt doc_id={doc_id}")
-    text_wf = GeminiTextWorkflow(client)
-    job_t = await text_wf.run_text(prompt=prompt, document_ids=[doc_id])
+    job_t = await run_text_with_flash_fallback(
+        client, prompt=prompt, document_ids=[doc_id], on_progress=pct_cb,
+    )
     if _is_stale_doc_error(job_t):
         stale_doc = VARIANT_DOCS.get(variant)
         logger.warning(
@@ -143,8 +148,9 @@ async def run_brand_text2img(
             await invalidate_brand_doc(stale_doc)
         doc_id = await get_text2img_doc(client, variant)
         logger.info(f"[brand_t2i:{variant}] retry with fresh doc_id={doc_id}")
-        text_wf = GeminiTextWorkflow(client)
-        job_t = await text_wf.run_text(prompt=prompt, document_ids=[doc_id])
+        job_t = await run_text_with_flash_fallback(
+            client, prompt=prompt, document_ids=[doc_id], on_progress=pct_cb,
+        )
     if job_t.status != "completed" or not (job_t.result_text or "").strip():
         logger.warning(
             f"[brand_t2i:{variant}] Gemini Text failed: status={job_t.status} err={job_t.error!r}"
@@ -172,9 +178,11 @@ async def run_brand_text2img(
     def _new_img_wf() -> ImageGenWorkflow:
         # Каждый retry — свежий ImageGenWorkflow, чтобы _last_price/state
         # не утекали между сабмитами.
-        return ImageGenWorkflow(
+        wf = ImageGenWorkflow(
             client, model_name=model_name, ratio=ratio, resolution=resolution
         )
+        wf.on_progress = pct_cb
+        return wf
 
     img_job = await _new_img_wf().run(prompt=current_prompt)
 

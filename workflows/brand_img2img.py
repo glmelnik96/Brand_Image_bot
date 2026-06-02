@@ -25,14 +25,17 @@ from loguru import logger
 
 from client.api import PhygitalClient
 from client.models import GenerationJob
+from workflows.base import ProgressCallback
 from workflows.brand_docs import IMG2IMG_DOC, get_img2img_doc, invalidate_brand_doc
-from workflows.gemini_text import GeminiTextWorkflow
+from workflows.gemini_text import run_text_with_flash_fallback
 from workflows.image_to_image import ImageToImageWorkflow
 
 # Фикс-текст для Gemini Text. Не редактируется пользователем — суть в system-prompt-документе.
 BRAND_I2I_PROMPT = "Read the System Prompt"
 # Callback для статус-апдейтов между шагами цепочки. None — молча работаем.
 ProgressCb = Optional[Callable[[str], Awaitable[None]]]
+# Callback для процента внутри одного этапа (0..1). None — молча работаем.
+PctCb = Optional[ProgressCallback]
 
 
 async def run_brand_img2img(
@@ -43,23 +46,26 @@ async def run_brand_img2img(
     ratio: str = "r_3_4",
     resolution: str = "k2",
     progress_cb: ProgressCb = None,
+    pct_cb: PctCb = None,
 ) -> GenerationJob:
     """Bind user-image(s) → описание (Gemini) → картинка (Nano Banana с теми же init-img)."""
     img_wf = ImageToImageWorkflow(
         client, model_name=model_name, ratio=ratio, resolution=resolution
     )
+    img_wf.on_progress = pct_cb
     # Аплоадим один раз; ids/dims переиспользуем для Gemini Text и Nano Banana.
     ids, dims = await img_wf.upload_images(init_paths)
     img_wf._init_img_ids = ids
     img_wf._init_img_dims = dims
 
     doc_id = await get_img2img_doc(client)
-    text_wf = GeminiTextWorkflow(client)
-    job_t = await text_wf.run_text(
+    job_t = await run_text_with_flash_fallback(
+        client,
         prompt=BRAND_I2I_PROMPT,
         init_img_ids=ids,
         init_img_dims=dims,
         document_ids=[doc_id],
+        on_progress=pct_cb,
     )
     if job_t.status != "completed" and "cannot upload files" in (job_t.error or "").lower():
         logger.warning(
@@ -69,12 +75,13 @@ async def run_brand_img2img(
         await invalidate_brand_doc(IMG2IMG_DOC)
         doc_id = await get_img2img_doc(client)
         logger.info(f"[brand_i2i] retry with fresh doc_id={doc_id}")
-        text_wf = GeminiTextWorkflow(client)
-        job_t = await text_wf.run_text(
+        job_t = await run_text_with_flash_fallback(
+            client,
             prompt=BRAND_I2I_PROMPT,
             init_img_ids=ids,
             init_img_dims=dims,
             document_ids=[doc_id],
+            on_progress=pct_cb,
         )
     if job_t.status != "completed" or not (job_t.result_text or "").strip():
         logger.warning(

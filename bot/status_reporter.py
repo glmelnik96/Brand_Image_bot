@@ -78,6 +78,9 @@ class StatusReporter:
         self._phase: str = "принято"        # принято / в очереди / жду слот / генерация / готово / ошибка
         self._sub: str = ""                  # текущий этап (Gemini Text / Nano Banana / ...)
         self._extra_line: str = ""           # дополнительная строка под основным статусом (для ошибок)
+        # Прогресс текущего этапа в 0..1. Сбрасывается при step() / start().
+        # Если задан — в _compose_text используется вместо elapsed/eta хвоста.
+        self._progress: float | None = None
 
         # Тайминги
         self._run_started: float | None = None        # когда поехала генерация (после global_sem)
@@ -115,6 +118,7 @@ class StatusReporter:
         self._phase = "генерация"
         self._sub = first_step
         self._step_started = now
+        self._progress = None
         self._ensure_tick_running()
         await self._render()
 
@@ -126,6 +130,23 @@ class StatusReporter:
             self._step_times.append((self._sub, dur))
         self._sub = name
         self._step_started = now
+        # Новый этап — сбрасываем прогресс. Workflow начнёт пушить с 0..1 заново.
+        self._progress = None
+        await self._render()
+
+    async def progress(self, value: float) -> None:
+        """Колбэк для Workflow.on_progress (0..1). Обновляет процент в текущем этапе.
+        Сам процент рендерит _compose_text — здесь только сохраняем + триггерим render.
+        """
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return
+        v = max(0.0, min(1.0, v))
+        # Дедуп шагом 1% — иначе при synth-режиме edit_text спамится каждый poll.
+        if self._progress is not None and abs(v - self._progress) < 0.01:
+            return
+        self._progress = v
         await self._render()
 
     async def done(self, *, job_id: str | None) -> None:
@@ -203,12 +224,19 @@ class StatusReporter:
     def _compose_text(self) -> str:
         """Финальная строка для edit_text."""
         line1 = f"{self.label} — {self._phase}"
-        # elapsed/eta — только если генерация уже стартовала
+        # elapsed[/eta] — только если генерация уже стартовала.
+        # В фазе «генерация» если воркфлоу пушит progress — показываем процент
+        # вместо eta (по аналогии с панелью Phygital-Adobe-Studio).
         if self._run_started is not None and self._phase in {"в очереди", "генерация"}:
             elapsed = time.monotonic() - self._run_started
-            tail = _fmt_mmss(elapsed)
-            if self._eta_str:
-                tail = f"{tail} / {self._eta_str}"
+            elapsed_str = _fmt_mmss(elapsed)
+            if self._phase == "генерация" and self._progress is not None:
+                pct = int(round(self._progress * 100))
+                tail = f"{elapsed_str} • {pct}%"
+            elif self._eta_str:
+                tail = f"{elapsed_str} / {self._eta_str}"
+            else:
+                tail = elapsed_str
             sub_with_time = f"{self._sub} • {tail}" if self._sub else tail
         else:
             sub_with_time = self._sub

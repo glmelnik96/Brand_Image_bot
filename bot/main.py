@@ -30,7 +30,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, TypeHandler
 from telegram.request import HTTPXRequest
 
 from bot.auth import whitelist_only
-from bot.scenarios import MENU_KEYBOARD, build_conversations, build_extra_handlers
+from bot.scenarios import _menu_root_kb_for, build_conversations, build_extra_handlers
 from bot.state import MAX_PER_USER_INFLIGHT, USER_QUEUE_LIMIT, get_state
 from client.config import ROOT, settings
 
@@ -77,9 +77,12 @@ HELP_TEXT = (
 # Меняешь текст → меняется хэш → бот при следующем запуске разошлёт повторно
 # и положит новый marker-файл. Без смены текста — повторных рассылок нет.
 STARTUP_BROADCAST_TEXT = (
-    "Бот запущен и работает до конца рабочего дня.\n\n"
-    "Появилась обратная связь: в главном меню — кнопка «Обратная связь».\n"
-    "Под каждым результатом — 👍 / 👎, чтобы быстро отметить попадание.\n\n"
+    "Бот обновился, работает до конца рабочего дня.\n\n"
+    "Что нового:\n"
+    "— Под портретом спикера теперь есть «Удалить фон» — присылаю PNG-файл с прозрачностью.\n"
+    "— Статус генерации показывает реальный процент прогресса, а не только время.\n"
+    "— Если Gemini Pro упал (ошибка / 504) — автоматически пробую тот же шаг на Flash, "
+    "чтобы сценарий доехал.\n\n"
     "Если будет минутка — пройди короткий опрос (12 вопросов, можно пропускать). "
     "Поможет понять, куда двигать бота дальше: /menu → «Обратная связь» → «Пройти опрос»."
 )
@@ -87,10 +90,11 @@ STARTUP_BROADCAST_TEXT = (
 
 @whitelist_only
 async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id if update.effective_user else None
     await update.message.reply_text(
         "Привет! Это Brand Image Bot — генерация и редактирование картинок.\n"
         "Выбери сценарий кнопкой ниже или открой /help, если нужны подробности.",
-        reply_markup=MENU_KEYBOARD,
+        reply_markup=_menu_root_kb_for(uid),
     )
 
 
