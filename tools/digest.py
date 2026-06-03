@@ -70,8 +70,16 @@ HTTP_LINE_RE = re.compile(r"^(GET|POST|PUT|DELETE|PATCH)\s+https?://")
 PROMPT_RE = re.compile(r"prompt=(?P<q>['\"])(?P<text>.*?)(?<!\\)(?P=q)")
 WORKFLOW_RE = re.compile(r"workflow=(\w+)")
 TASK_RESULT_RE = re.compile(r"job result status=(?P<status>\w+)\s+urls=(?P<urls>\d+)\s+dur=(?P<dur>[\d.]+)s")
-# admin-stat: gen_done uid=438074662 uname='glmelnik96' workflow=brand_t2i wf_count=3 user_total=12 urls=1 dur=58.7s
+# Текущий формат (с 2026-06-04+credits):
+# admin-stat: gen_done user=@glmelnik96 (id=438074662) workflow=brand_t2i wf_count=3 user_total=12 price=12.50 wf_credits=37.50 user_credits_total=150.30 urls=1 dur=58.7s
 ADMIN_STAT_RE = re.compile(
+    r"admin-stat:\s+gen_done\s+user=(?P<user>.+?)\s+\(id=(?P<uid>\d+)\)"
+    r"\s+workflow=(?P<workflow>\w+)\s+wf_count=\d+\s+user_total=\d+"
+    r"(?:\s+price=(?P<price>\S+))?"
+)
+# Legacy-формат (до 2026-06-04: numeric uid + uname без credits) — оставлен,
+# чтобы дайджест мог восстановить статистику по старым логам после рестарта.
+ADMIN_STAT_RE_LEGACY = re.compile(
     r"admin-stat:\s+gen_done\s+uid=(?P<uid>\d+)\s+uname=(?P<q>['\"])(?P<uname>.*?)(?<!\\)(?P=q)"
     r"\s+workflow=(?P<workflow>\w+)\s+wf_count=\d+\s+user_total=\d+"
 )
@@ -174,28 +182,42 @@ def render(stats: dict, since: datetime | None) -> str:
     else:
         out.append("\n_Нет завершённых задач в периоде._")
 
-    # 2.5) Per-user — успешные генерации (admin-stat)
-    out.append("\n## 2.5) По пользователям (успешные генерации)")
+    # 2.5) Per-user — успешные генерации + кредиты (admin-stat)
+    out.append("\n## 2.5) По пользователям (успешные генерации и кредиты)")
     user_gens: dict[int, Counter] = stats.get("user_gens", {})
     user_names: dict[int, str] = stats.get("user_names", {})
+    user_credits: dict[int, dict[str, float]] = stats.get("user_credits", {})
     if user_gens:
-        # Сортируем по убыванию total.
+        # Сортируем по убыванию total потраченных кредитов (fallback — по числу генераций).
         ranked = sorted(
-            user_gens.items(), key=lambda kv: -sum(kv[1].values())
+            user_gens.items(),
+            key=lambda kv: (
+                -sum((user_credits.get(kv[0]) or {}).values()),
+                -sum(kv[1].values()),
+            ),
         )
+        total_gens_all = sum(sum(c.values()) for c in user_gens.values())
+        total_credits_all = sum(sum(c.values()) for c in user_credits.values())
         out.append(
             f"\nВсего активных пользователей: **{len(ranked)}**, "
-            f"всего успешных генераций: **{sum(sum(c.values()) for c in user_gens.values())}**\n"
+            f"успешных генераций: **{total_gens_all}**, "
+            f"списано кредитов: **{total_credits_all:.2f}**\n"
         )
-        out.append("| UID | Username | Total | По workflow |")
-        out.append("|---|---|---:|---|")
+        out.append("| Пользователь | UID | Total gen | Credits | По workflow (gen / credits) |")
+        out.append("|---|---|---:|---:|---|")
         for uid_i, counter in ranked:
             total = sum(counter.values())
             uname = user_names.get(uid_i, "—")
+            credits_by_wf = user_credits.get(uid_i, {})
+            credits_total = sum(credits_by_wf.values())
             by_wf = ", ".join(
-                f"{wf}={n}" for wf, n in sorted(counter.items(), key=lambda kv: -kv[1])
+                f"{wf}={n}"
+                + (f"/{credits_by_wf[wf]:.2f}c" if credits_by_wf.get(wf) else "")
+                for wf, n in sorted(counter.items(), key=lambda kv: -kv[1])
             )
-            out.append(f"| `{uid_i}` | {uname} | {total} | {by_wf} |")
+            out.append(
+                f"| {uname} | `{uid_i}` | {total} | {credits_total:.2f} | {by_wf} |"
+            )
     else:
         out.append(
             "\n_Нет admin-stat-строк в логах. Они начали писаться вместе с этой версией digest'а_"
@@ -266,8 +288,11 @@ def main() -> int:
         "task_results": {"count": 0, "completed": 0, "dur_sum": 0.0, "urls": 0, "durs": []},
         # uid → Counter(workflow → n) — успешные генерации по пользователям (admin-stat).
         "user_gens": defaultdict(Counter),
-        # uid → последний известный uname (берём из admin-stat-строки).
+        # uid → последний известный display (`@username` или ФИО) из admin-stat-строки.
         "user_names": {},
+        # uid → workflow → суммарно потраченных кредитов (price из job.raw["_taskPrice"]).
+        # Пишется только новым форматом admin-stat (с 2026-06-04). Legacy-строки не учитываются.
+        "user_credits": defaultdict(lambda: defaultdict(float)),
     }
 
     for m in iter_lines(files, since):
@@ -314,17 +339,36 @@ def main() -> int:
                 stats["prompts_by_scenario"][scen_key][text] += 1
 
         # 4.5) Per-user админ-статистика — отдельная строка на каждую успешную генерацию.
+        # Сначала пробуем актуальный формат (user=... (id=...) ... price=...), потом legacy.
         am = ADMIN_STAT_RE.search(msg)
         if am:
             try:
                 uid_i = int(am.group("uid"))
                 wf = am.group("workflow")
                 stats["user_gens"][uid_i][wf] += 1
-                uname = am.group("uname") or ""
-                if uname:
-                    stats["user_names"][uid_i] = uname
+                user_disp = (am.group("user") or "").strip()
+                if user_disp and user_disp != "?":
+                    stats["user_names"][uid_i] = user_disp
+                price_raw = am.group("price")
+                if price_raw and price_raw != "?":
+                    try:
+                        stats["user_credits"][uid_i][wf] += float(price_raw)
+                    except ValueError:
+                        pass
             except (ValueError, KeyError):
                 pass
+        else:
+            am_old = ADMIN_STAT_RE_LEGACY.search(msg)
+            if am_old:
+                try:
+                    uid_i = int(am_old.group("uid"))
+                    wf = am_old.group("workflow")
+                    stats["user_gens"][uid_i][wf] += 1
+                    uname = am_old.group("uname") or ""
+                    if uname and uid_i not in stats["user_names"]:
+                        stats["user_names"][uid_i] = uname  # legacy без @
+                except (ValueError, KeyError):
+                    pass
 
         # 5) Результаты задач
         tm = TASK_RESULT_RE.search(msg)

@@ -254,9 +254,12 @@ class GeminiTextWorkflow(Workflow):
                         job_id=job_id, status="failed",
                         error="gemini-text done but description is empty", raw=data,
                     )
+                _raw: dict[str, Any] = {"task": data}
+                if self._last_price:
+                    _raw["_taskPrice"] = self._last_price
                 return GenerationJob(
                     job_id=job_id, status="completed",
-                    result_text=text, raw={"task": data},
+                    result_text=text, raw=_raw,
                 )
 
             if status in FAIL_STATUSES:

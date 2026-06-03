@@ -281,9 +281,12 @@ class MidJourneyImagineWorkflow(Workflow):
                     )
                 links = await self.client.get_download_links(link_ids)
                 urls = [lnk["download_link"] for lnk in links if lnk.get("download_link")]
+                _raw: dict[str, Any] = {"task": data, "links": links}
+                if self._last_price:
+                    _raw["_taskPrice"] = self._last_price
                 return GenerationJob(
                     job_id=job_id, status="completed",
-                    result_urls=urls, raw={"task": data, "links": links},
+                    result_urls=urls, raw=_raw,
                 )
 
             if status in FAIL_STATUSES:
@@ -441,9 +444,12 @@ class _MJChildWorkflow(Workflow):
                     )
                 links = await self.client.get_download_links(link_ids)
                 urls = [lnk["download_link"] for lnk in links if lnk.get("download_link")]
+                _raw: dict[str, Any] = {"task": data, "links": links}
+                if self._last_price:
+                    _raw["_taskPrice"] = self._last_price
                 return GenerationJob(
                     job_id=job_id, status="completed",
-                    result_urls=urls, raw={"task": data, "links": links},
+                    result_urls=urls, raw=_raw,
                 )
 
             if status in FAIL_STATUSES:

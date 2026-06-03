@@ -38,7 +38,7 @@ import time
 import uuid
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 import httpx
 from loguru import logger
@@ -129,6 +129,37 @@ NANO_BANANA_MODEL = "v3_1"
 # остаются ранее записанные «admin-stat» строки, по которым tools/digest.py восстанавливает
 # total за период). Структура: uid → Counter(workflow → n).
 _USER_GEN_STATS: dict[int, Counter] = defaultdict(Counter)
+# Параллельный счётчик кредитов на пользователя (cumulative по workflow).
+# Цена приходит из job.raw["_taskPrice"]["price"] — её туда кладут leaf-воркфлоу
+# (image_gen / midjourney / photoroom / gpt_image / gemini_text) из ответа
+# POST /api/v2/nodes/get_credits_price. Структура: uid → {workflow: float credits}.
+_USER_GEN_CREDITS: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+
+
+def _fmt_admin_user(uname: str | None, uid: int) -> str:
+    """Форматирует пользователя для admin-stat-лога: `@username (id=...)` если есть
+    Telegram username (без пробелов, не «?»), иначе fallback на `name (id=...)`.
+    Эвристика: TG-username не содержит пробелов; полное имя обычно содержит."""
+    u = (uname or "").strip()
+    if u and u != "?" and " " not in u and not u.startswith("@"):
+        return f"@{u} (id={uid})"
+    if u.startswith("@"):
+        return f"{u} (id={uid})"
+    return f"{u or '?'} (id={uid})"
+
+
+def _extract_task_price(job_raw: Any) -> float | None:
+    """Достаёт price (float) из job.raw["_taskPrice"], если он был запушен leaf-воркфлоу.
+    Phygital возвращает {"price": <num>, "details": {...}} — берём только price."""
+    if not isinstance(job_raw, dict):
+        return None
+    tp = job_raw.get("_taskPrice")
+    if not isinstance(tp, dict):
+        return None
+    p = tp.get("price")
+    if isinstance(p, (int, float)):
+        return float(p)
+    return None
 
 
 def _fmt_eta(seconds: int) -> str:
@@ -589,16 +620,28 @@ async def _execute_task(
                 except Exception as e:
                     log.opt(exception=e).warning(f"recipe save failed: {e!r}")
 
-            # Админ-лог: счётчик успешных генераций на пользователя. По одной строке на
-            # каждую успешную задачу — легко грепать и парсить (см. tools/digest.py,
-            # секция «По пользователям»). Формат строго: ключ=значение, без вложенных кавычек.
+            # Админ-лог: счётчик успешных генераций + потраченных кредитов на пользователя.
+            # По одной строке на каждую успешную задачу — легко грепать и парсить (см.
+            # tools/digest.py, секция «По пользователям»). Формат строго: ключ=значение,
+            # без вложенных кавычек. uname в формате `@username (id=...)` — формирует
+            # _fmt_admin_user(). Цена приходит из job.raw["_taskPrice"]["price"]
+            # (Phygital `/api/v2/nodes/get_credits_price`, кешируется leaf-воркфлоу).
             try:
                 _USER_GEN_STATS[uid][workflow_for_kb] += 1
                 user_total = sum(_USER_GEN_STATS[uid].values())
                 wf_count = _USER_GEN_STATS[uid][workflow_for_kb]
+                price = _extract_task_price(job.raw)
+                if price is not None:
+                    _USER_GEN_CREDITS[uid][workflow_for_kb] += price
+                user_credits_total = sum(_USER_GEN_CREDITS[uid].values())
+                wf_credits = _USER_GEN_CREDITS[uid][workflow_for_kb]
+                user_disp = _fmt_admin_user(uname, uid)
+                price_str = f"{price:.2f}" if price is not None else "?"
                 log.info(
-                    f"admin-stat: gen_done uid={uid} uname={uname!r} "
+                    f"admin-stat: gen_done user={user_disp} "
                     f"workflow={workflow_for_kb} wf_count={wf_count} user_total={user_total} "
+                    f"price={price_str} wf_credits={wf_credits:.2f} "
+                    f"user_credits_total={user_credits_total:.2f} "
                     f"urls={len(job.result_urls)} dur={gen_dur:.1f}s"
                 )
             except Exception as e:
