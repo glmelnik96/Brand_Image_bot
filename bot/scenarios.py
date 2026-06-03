@@ -187,7 +187,9 @@ def _kb(
     return InlineKeyboardMarkup(rows)
 
 
-def _action_keyboard(task_uid: str, *, workflow: str = "nb_t2i") -> InlineKeyboardMarkup:
+def _action_keyboard(
+    task_uid: str, *, workflow: str = "nb_t2i", variant: str | None = None
+) -> InlineKeyboardMarkup:
     """Клавиатура под готовый результат — кнопки повторного использования.
 
     Раскладка зависит от сценария:
@@ -219,6 +221,12 @@ def _action_keyboard(task_uid: str, *, workflow: str = "nb_t2i") -> InlineKeyboa
         rows.append([
             InlineKeyboardButton("Изменить изображение", callback_data=f"asi2i:{task_uid}"),
         ])
+        # Render / 2d Isometry часто нужны без фона (для подложек на сайт, презы и т.д.).
+        # Под Photo не показываем — фотореалистичные сцены обычно без отдельного предмета.
+        if variant in ("render", "isometric"):
+            rows.append([
+                InlineKeyboardButton("Удалить фон", callback_data=f"spkrrmbg:{task_uid}")
+            ])
     elif workflow in ("speaker", "speaker_bg"):
         # 5 brand-цветов под результатом портрета: разбиваем 3+2 чтобы метки помещались.
         color_btns = [
@@ -525,6 +533,13 @@ async def _execute_task(
                 if all_results_local:
                     first_result_local = all_results_local[0]
             else:
+                # variant нужен только для brand_t2i (photo/render/isometric) — определяет,
+                # показывать ли кнопку «Удалить фон» под результатом.
+                variant_for_kb: str | None = None
+                if recipe_template is not None and isinstance(recipe_template.params, dict):
+                    v = recipe_template.params.get("variant")
+                    if isinstance(v, str):
+                        variant_for_kb = v
                 # Скачиваем + отправляем каждую картинку; ловим путь к первой для regen-cache.
                 for i, url in enumerate(job.result_urls, 1):
                     local = await _send_result_image(
@@ -533,6 +548,7 @@ async def _execute_task(
                         with_action_kb=(i == 1 and recipe_template is not None),
                         action_task_uid=task_uid,
                         action_workflow=workflow_for_kb,
+                        action_variant=variant_for_kb,
                         as_document=send_as_document,
                     )
                     if i == 1 and local is not None:
@@ -723,6 +739,7 @@ async def _send_result_image(
     *, chat: Chat, log, url: str, uid: int, task_uid: str, idx: int, total: int,
     with_action_kb: bool = False, action_task_uid: str | None = None,
     action_workflow: str = "nb_t2i",
+    action_variant: str | None = None,
     as_document: bool = False,
 ) -> Path | None:
     """Скачивает result-картинку и отправляет в чат. Возвращает локальный путь (для regen_cache).
@@ -746,7 +763,7 @@ async def _send_result_image(
     """
     state = get_state()
     kb = (
-        _action_keyboard(action_task_uid, workflow=action_workflow)
+        _action_keyboard(action_task_uid, workflow=action_workflow, variant=action_variant)
         if (with_action_kb and action_task_uid)
         else None
     )
