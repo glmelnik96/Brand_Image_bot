@@ -70,6 +70,11 @@ HTTP_LINE_RE = re.compile(r"^(GET|POST|PUT|DELETE|PATCH)\s+https?://")
 PROMPT_RE = re.compile(r"prompt=(?P<q>['\"])(?P<text>.*?)(?<!\\)(?P=q)")
 WORKFLOW_RE = re.compile(r"workflow=(\w+)")
 TASK_RESULT_RE = re.compile(r"job result status=(?P<status>\w+)\s+urls=(?P<urls>\d+)\s+dur=(?P<dur>[\d.]+)s")
+# admin-stat: gen_done uid=438074662 uname='glmelnik96' workflow=brand_t2i wf_count=3 user_total=12 urls=1 dur=58.7s
+ADMIN_STAT_RE = re.compile(
+    r"admin-stat:\s+gen_done\s+uid=(?P<uid>\d+)\s+uname=(?P<q>['\"])(?P<uname>.*?)(?<!\\)(?P=q)"
+    r"\s+workflow=(?P<workflow>\w+)\s+wf_count=\d+\s+user_total=\d+"
+)
 
 
 def parse_since(s: str | None) -> datetime | None:
@@ -169,6 +174,34 @@ def render(stats: dict, since: datetime | None) -> str:
     else:
         out.append("\n_Нет завершённых задач в периоде._")
 
+    # 2.5) Per-user — успешные генерации (admin-stat)
+    out.append("\n## 2.5) По пользователям (успешные генерации)")
+    user_gens: dict[int, Counter] = stats.get("user_gens", {})
+    user_names: dict[int, str] = stats.get("user_names", {})
+    if user_gens:
+        # Сортируем по убыванию total.
+        ranked = sorted(
+            user_gens.items(), key=lambda kv: -sum(kv[1].values())
+        )
+        out.append(
+            f"\nВсего активных пользователей: **{len(ranked)}**, "
+            f"всего успешных генераций: **{sum(sum(c.values()) for c in user_gens.values())}**\n"
+        )
+        out.append("| UID | Username | Total | По workflow |")
+        out.append("|---|---|---:|---|")
+        for uid_i, counter in ranked:
+            total = sum(counter.values())
+            uname = user_names.get(uid_i, "—")
+            by_wf = ", ".join(
+                f"{wf}={n}" for wf, n in sorted(counter.items(), key=lambda kv: -kv[1])
+            )
+            out.append(f"| `{uid_i}` | {uname} | {total} | {by_wf} |")
+    else:
+        out.append(
+            "\n_Нет admin-stat-строк в логах. Они начали писаться вместе с этой версией digest'а_"
+            "_ — старые логи не содержат счётчиков по пользователям._"
+        )
+
     # 2) HTTP запросы
     out.append("\n## 3) HTTP-запросы (Phygital + auth)")
     http = stats["http"]
@@ -231,6 +264,10 @@ def main() -> int:
         "prompts_all": Counter(),
         "prompts_by_scenario": defaultdict(Counter),
         "task_results": {"count": 0, "completed": 0, "dur_sum": 0.0, "urls": 0, "durs": []},
+        # uid → Counter(workflow → n) — успешные генерации по пользователям (admin-stat).
+        "user_gens": defaultdict(Counter),
+        # uid → последний известный uname (берём из admin-stat-строки).
+        "user_names": {},
     }
 
     for m in iter_lines(files, since):
@@ -275,6 +312,19 @@ def main() -> int:
             if scen_key:
                 stats["prompts_all"][text] += 1
                 stats["prompts_by_scenario"][scen_key][text] += 1
+
+        # 4.5) Per-user админ-статистика — отдельная строка на каждую успешную генерацию.
+        am = ADMIN_STAT_RE.search(msg)
+        if am:
+            try:
+                uid_i = int(am.group("uid"))
+                wf = am.group("workflow")
+                stats["user_gens"][uid_i][wf] += 1
+                uname = am.group("uname") or ""
+                if uname:
+                    stats["user_names"][uid_i] = uname
+            except (ValueError, KeyError):
+                pass
 
         # 5) Результаты задач
         tm = TASK_RESULT_RE.search(msg)

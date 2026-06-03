@@ -36,6 +36,7 @@ import html
 import shutil
 import time
 import uuid
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -121,6 +122,13 @@ ETA_MJ_VARIATION_SEC = 70
 # Фиксированный вариант модели Nano Banana — Phygital поддерживает v2/v2.5/v3/v3.1,
 # боту оставили только v3.1 (Pro), чтобы убрать лишний шаг пикера.
 NANO_BANANA_MODEL = "v3_1"
+
+
+# Per-process счётчик успешных генераций на пользователя для админ-логирования.
+# Накапливается с момента старта процесса (после рестарта обнуляется — но в логах
+# остаются ранее записанные «admin-stat» строки, по которым tools/digest.py восстанавливает
+# total за период). Структура: uid → Counter(workflow → n).
+_USER_GEN_STATS: dict[int, Counter] = defaultdict(Counter)
 
 
 def _fmt_eta(seconds: int) -> str:
@@ -580,6 +588,21 @@ async def _execute_task(
                     )
                 except Exception as e:
                     log.opt(exception=e).warning(f"recipe save failed: {e!r}")
+
+            # Админ-лог: счётчик успешных генераций на пользователя. По одной строке на
+            # каждую успешную задачу — легко грепать и парсить (см. tools/digest.py,
+            # секция «По пользователям»). Формат строго: ключ=значение, без вложенных кавычек.
+            try:
+                _USER_GEN_STATS[uid][workflow_for_kb] += 1
+                user_total = sum(_USER_GEN_STATS[uid].values())
+                wf_count = _USER_GEN_STATS[uid][workflow_for_kb]
+                log.info(
+                    f"admin-stat: gen_done uid={uid} uname={uname!r} "
+                    f"workflow={workflow_for_kb} wf_count={wf_count} user_total={user_total} "
+                    f"urls={len(job.result_urls)} dur={gen_dur:.1f}s"
+                )
+            except Exception as e:
+                log.opt(exception=e).warning(f"admin-stat counter failed: {e!r}")
 
             # Хук обратной связи: считаем успешную генерацию + (по триггеру) шлём баннер опроса.
             # Не блокируем основной поток исключениями из feedback-подсистемы.
