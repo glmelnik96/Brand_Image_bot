@@ -265,6 +265,106 @@ def render(stats: dict, since: datetime | None) -> str:
     return "\n".join(out) + "\n"
 
 
+def collect_user_stats(
+    since: datetime | None = None, logs: list[Path] | None = None
+) -> dict:
+    """Парсит логи и возвращает только per-user срез (без HTTP/промптов/сценариев).
+    Используется командой /admin_stat в боте, чтобы не гонять полный render().
+
+    Возвращает dict с ключами `user_gens`, `user_names`, `user_credits`
+    (та же структура, что в build_stats() ниже).
+    """
+    files = logs if logs is not None else discover_logs(None)
+    user_gens: dict[int, Counter] = defaultdict(Counter)
+    user_names: dict[int, str] = {}
+    user_credits: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+
+    for m in iter_lines(files, since):
+        msg = m["msg"]
+        am = ADMIN_STAT_RE.search(msg)
+        if am:
+            try:
+                uid_i = int(am.group("uid"))
+                wf = am.group("workflow")
+                user_gens[uid_i][wf] += 1
+                user_disp = (am.group("user") or "").strip()
+                if user_disp and user_disp != "?":
+                    user_names[uid_i] = user_disp
+                price_raw = am.group("price")
+                if price_raw and price_raw != "?":
+                    try:
+                        user_credits[uid_i][wf] += float(price_raw)
+                    except ValueError:
+                        pass
+            except (ValueError, KeyError):
+                pass
+            continue
+        am_old = ADMIN_STAT_RE_LEGACY.search(msg)
+        if am_old:
+            try:
+                uid_i = int(am_old.group("uid"))
+                wf = am_old.group("workflow")
+                user_gens[uid_i][wf] += 1
+                uname = am_old.group("uname") or ""
+                if uname and uid_i not in user_names:
+                    user_names[uid_i] = uname
+            except (ValueError, KeyError):
+                pass
+    return {
+        "user_gens": user_gens,
+        "user_names": user_names,
+        "user_credits": user_credits,
+    }
+
+
+def format_user_stats(stats: dict, since: datetime | None = None) -> str:
+    """Рендерит per-user срез как Markdown — для /admin_stat. Без таблиц (Telegram
+    не парсит pipe-таблицы), формат — bullet-list, group `@user (id=...)` →
+    workflow=N (Xc), потом строка с total."""
+    user_gens: dict[int, Counter] = stats.get("user_gens", {})
+    user_names: dict[int, str] = stats.get("user_names", {})
+    user_credits: dict[int, dict[str, float]] = stats.get("user_credits", {})
+    if not user_gens:
+        period = f" с {since.isoformat(timespec='minutes')}" if since else ""
+        return f"Нет данных по пользователям{period}. Пока никто не успел сгенерировать."
+
+    lines: list[str] = []
+    if since:
+        lines.append(
+            f"<b>Период:</b> с {since.isoformat(timespec='minutes')} "
+            f"по {datetime.now().isoformat(timespec='minutes')}"
+        )
+    total_gens_all = sum(sum(c.values()) for c in user_gens.values())
+    total_credits_all = sum(sum(c.values()) for c in user_credits.values())
+    lines.append(
+        f"<b>Итого:</b> {len(user_gens)} польз., {total_gens_all} ген., "
+        f"{total_credits_all:.2f} кредитов\n"
+    )
+
+    ranked = sorted(
+        user_gens.items(),
+        key=lambda kv: (
+            -sum((user_credits.get(kv[0]) or {}).values()),
+            -sum(kv[1].values()),
+        ),
+    )
+    for uid_i, counter in ranked:
+        uname = user_names.get(uid_i, "—")
+        credits_by_wf = user_credits.get(uid_i, {})
+        credits_total = sum(credits_by_wf.values())
+        total = sum(counter.values())
+        lines.append(
+            f"<b>{uname}</b> <code>id={uid_i}</code> — "
+            f"<b>{total}</b> ген., <b>{credits_total:.2f}</b>c"
+        )
+        for wf, n in sorted(counter.items(), key=lambda kv: -kv[1]):
+            c = credits_by_wf.get(wf, 0.0)
+            suffix = f" ({c:.2f}c)" if c else ""
+            lines.append(f"  • {wf}: {n}{suffix}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Digest над logs/bot.log* (счётчики сценариев / запросов / промптов).")
     ap.add_argument("--since", help="'24h' | '7d' | 'YYYY-MM-DD' — отсечка по времени. По умолчанию: все логи.")

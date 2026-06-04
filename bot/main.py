@@ -111,6 +111,49 @@ async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(HELP_TEXT)
 
 
+# ── /admin_stat — приватная админская сводка по пользователям ─────────────
+# Доступна только UID 438074662 (Глеб). Парсит logs/bot.log* через
+# tools.digest.collect_user_stats и шлёт Markdown-like HTML-вывод в чат.
+# Поддерживает аргумент: /admin_stat 24h | 7d | YYYY-MM-DD (дефолт: 7d).
+ADMIN_STAT_UID = 438074662
+
+
+async def cmd_admin_stat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    u = update.effective_user
+    if not u or u.id != ADMIN_STAT_UID:
+        # Тихо игнорируем — команда не должна светиться остальным.
+        return
+    # late import: tools/digest не нужен в импортном графе старта бота.
+    from tools.digest import collect_user_stats, format_user_stats, parse_since
+
+    arg = " ".join(ctx.args).strip() if ctx.args else "7d"
+    try:
+        since = parse_since(arg)
+    except SystemExit as e:
+        await update.message.reply_text(f"Ошибка аргумента: {e}")
+        return
+    try:
+        stats = collect_user_stats(since=since)
+        text = format_user_stats(stats, since=since)
+    except Exception as e:
+        logger.opt(exception=e).warning(f"admin_stat: collect failed: {e!r}")
+        await update.message.reply_text(f"Ошибка: {type(e).__name__}: {e}")
+        return
+    # Telegram-лимит 4096 символов на сообщение — режем при необходимости.
+    chunks: list[str] = []
+    cur = ""
+    for line in text.splitlines(keepends=True):
+        if len(cur) + len(line) > 3800:
+            chunks.append(cur)
+            cur = line
+        else:
+            cur += line
+    if cur:
+        chunks.append(cur)
+    for ch in chunks:
+        await update.message.reply_text(ch, parse_mode="HTML")
+
+
 # ── error handler ──────────────────────────────────────────────────────────
 async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     err = ctx.error
@@ -322,6 +365,9 @@ def build_app() -> Application:
     # /start, /help — регистрируем ДО conversation, чтобы они всегда срабатывали.
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    # /admin_stat — приватный, доступен только UID ADMIN_STAT_UID. Внутри cmd_admin_stat
+    # проверка по uid; для остальных команда «не существует» (silent return).
+    app.add_handler(CommandHandler("admin_stat", cmd_admin_stat))
     # Conversations
     for conv in build_conversations():
         app.add_handler(conv)
