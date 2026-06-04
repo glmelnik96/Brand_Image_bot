@@ -99,6 +99,21 @@ class SessionManager:
             return None
         data = json.loads(self.storage_path.read_text(encoding="utf-8"))
         session = Session(cookies=data.get("cookies", []))
+        # Восстанавливаем captured_at — иначе дефолт-фабрика поставит datetime.now(),
+        # и _find_fresher_recon_dump никогда не найдёт «свежий» дамп (mtime ≤ now).
+        cap_raw = data.get("captured_at")
+        if isinstance(cap_raw, str):
+            try:
+                session.captured_at = datetime.fromisoformat(cap_raw)
+            except ValueError:
+                logger.warning(f"captured_at unparseable ({cap_raw!r}); fallback to file mtime")
+                session.captured_at = datetime.fromtimestamp(
+                    self.storage_path.stat().st_mtime, tz=timezone.utc,
+                )
+        else:
+            session.captured_at = datetime.fromtimestamp(
+                self.storage_path.stat().st_mtime, tz=timezone.utc,
+            )
         if not session.access_token:
             logger.warning("Session loaded, but st-access-token missing")
         return session
