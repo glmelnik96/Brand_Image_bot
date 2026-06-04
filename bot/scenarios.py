@@ -348,9 +348,13 @@ def _menu_root_kb() -> InlineKeyboardMarkup:
 
 
 def _menu_make_kb() -> InlineKeyboardMarkup:
+    # Сценарий «Обычное изображение» (text→image Nano Banana) временно отключён —
+    # кнопка убрана; conv_generate-хендлер остаётся живым на случай прямого вызова
+    # через старую клавиатуру / pinned-сообщение (там его перехватит generate-disabled
+    # ответ при последующем включении). При возврате — раскомментировать строку.
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Бренд изображения", callback_data="menu:make_brand")],
-        [InlineKeyboardButton("Обычное изображение", callback_data="menu:generate")],
+        # [InlineKeyboardButton("Обычное изображение", callback_data="menu:generate")],
         [InlineKeyboardButton("Назад", callback_data="menu:root")],
     ])
 
