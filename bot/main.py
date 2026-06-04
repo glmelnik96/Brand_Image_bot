@@ -11,7 +11,9 @@
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import os
 import ssl
 import sys
 from pathlib import Path
@@ -249,6 +251,65 @@ def _make_request(pool_size: int, kwargs_template: dict | None) -> HTTPXRequest 
 
 PREFLIGHT_REFRESH_THRESHOLD_SEC = 15 * 60  # access JWT TTL ниже которого пробуем refresh
 
+# Фоновый рефрешер сессии: дёргает recon/refresh_capture (headless persistent profile),
+# чтобы Phygital не успел протухнуть refresh-токен между задачами. По умолчанию каждые 30 мин.
+# Отключается через BOT_AUTO_REFRESH_INTERVAL_MIN=0.
+_DEFAULT_AUTO_REFRESH_MIN = 30
+try:
+    AUTO_REFRESH_INTERVAL_MIN = int(os.environ.get("BOT_AUTO_REFRESH_INTERVAL_MIN", _DEFAULT_AUTO_REFRESH_MIN))
+except ValueError:
+    AUTO_REFRESH_INTERVAL_MIN = _DEFAULT_AUTO_REFRESH_MIN
+
+
+async def _auto_refresh_session_loop(state) -> None:
+    """Фоном держит сессию Phygital живой.
+
+    Каждые AUTO_REFRESH_INTERVAL_MIN минут:
+      1) гоняет recon.refresh_capture.main(headless=True) — снимает свежий
+         storage-*.json через персистентный профиль user_data/;
+      2) подсовывает этот дамп в текущую in-memory сессию через
+         SessionManager._find_fresher_recon_dump + _swap_session_inplace;
+      3) персистит обновлённую сессию на диск.
+
+    Любые исключения внутри итерации логируются и проглатываются — луп никогда
+    не падает. CancelledError пробрасывается чисто.
+    """
+    interval_sec = max(60, AUTO_REFRESH_INTERVAL_MIN * 60)
+    logger.info(
+        f"session auto-refresh: интервал {AUTO_REFRESH_INTERVAL_MIN} мин "
+        f"(headless recon-capture)"
+    )
+    # Первая итерация — спим, чтобы не конкурировать со стартовым _preflight_session.
+    while True:
+        try:
+            await asyncio.sleep(interval_sec)
+        except asyncio.CancelledError:
+            logger.info("session auto-refresh: cancelled")
+            raise
+        try:
+            from recon import refresh_capture  # late import: playwright тянется лениво
+            rc = await refresh_capture.main(headless=True)
+            if rc == 0:
+                fresh = state.session_manager._find_fresher_recon_dump(state.session)
+                if fresh is not None:
+                    state.session_manager._swap_session_inplace(state.session, fresh)
+                    state.session_manager.save(state.session)
+                    new_ttl = state.session.jwt_ttl_seconds()
+                    logger.info(
+                        f"session auto-refresh: подхватил {fresh.name}, "
+                        f"новый TTL={new_ttl}s ({(new_ttl or 0) // 60}m)"
+                    )
+                else:
+                    logger.warning("session auto-refresh: дамп сохранён, но fresher не найден (mtime / TTL фильтры)")
+            elif rc == 2:
+                logger.warning("session auto-refresh: профиль user_data разлогинен — нужен ручной recon.capture")
+            else:
+                logger.warning(f"session auto-refresh: recon вернул rc={rc}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.opt(exception=e).warning(f"session auto-refresh tick crashed: {e!r}")
+
 
 # ── post-init: сетим меню команд и прогреваем state ────────────────────────
 async def _post_init(app: Application) -> None:
@@ -264,6 +325,17 @@ async def _post_init(app: Application) -> None:
         ]
     )
     logger.info("Bot commands registered")
+    # Фоновый рефрешер Phygital-сессии. Не валит запуск, если плеяwright нет.
+    if AUTO_REFRESH_INTERVAL_MIN > 0:
+        try:
+            app.bot_data["_session_refresher_task"] = asyncio.create_task(
+                _auto_refresh_session_loop(state),
+                name="session-refresher",
+            )
+        except Exception as e:
+            logger.opt(exception=e).warning(f"session auto-refresh: не удалось запустить: {e!r}")
+    else:
+        logger.info("session auto-refresh: отключён (BOT_AUTO_REFRESH_INTERVAL_MIN=0)")
     # Стартовый broadcast (один раз на версию текста). Не валим запуск при ошибках.
     try:
         await _startup_broadcast(app)
