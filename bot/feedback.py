@@ -24,6 +24,7 @@ import asyncio
 import json
 import time
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -280,6 +281,19 @@ class FeedbackStore:
             lines.append(f"Топ причин 👎: {top_reasons}")
         lines.append(f"Опросов завершено: {len(surveys)}")
         lines.append(f"Комментариев: {len(comments)}")
+        if surveys:
+            lines.append("")
+            lines.append("<b>Опросы (последние):</b>")
+            for s in sorted(surveys, key=lambda x: x.get("ts", 0), reverse=True)[:10]:
+                ts = s.get("ts", 0)
+                dt = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "?"
+                a = len(s.get("answers") or {})
+                k = len(s.get("skipped") or [])
+                dur = s.get("duration_sec", 0)
+                ver = s.get("survey_version", "?")
+                lines.append(f"• {dt} uid={s.get('uid')} ver={ver} ответов:{a} пропущено:{k} {dur}с")
+            lines.append("")
+            lines.append("Полный дамп ответов: /admin_surveys")
         if comments:
             lines.append("")
             lines.append("<b>Последние 5 комментариев:</b>")
@@ -287,6 +301,97 @@ class FeedbackStore:
                 preview = text[:200].replace("<", "&lt;").replace(">", "&gt;")
                 lines.append(f"• [{cat}] {preview}")
         return "\n".join(lines)
+
+    # ── полный дамп ответов опросов (для /admin_surveys) ─────────────────
+    def format_surveys_dump(self, limit: int = 20) -> str:
+        """Читает feedback.jsonl, возвращает HTML с полными ответами по каждому
+        опросу (с человекочитаемыми лейблами). Сортирует от свежего к старому,
+        обрезает по limit.
+        """
+        if not EVENTS_FILE.exists():
+            return "Опросов пока нет."
+        surveys: list[dict] = []
+        try:
+            with EVENTS_FILE.open(encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except Exception:
+                        continue
+                    if ev.get("type") == "survey":
+                        surveys.append(ev)
+        except Exception as e:
+            return f"Ошибка чтения: {type(e).__name__}: {e}"
+        if not surveys:
+            return "Опросов пока нет."
+
+        surveys.sort(key=lambda x: x.get("ts", 0), reverse=True)
+        surveys = surveys[:limit]
+
+        # Карты: qid → Question, (qid, value) → label.
+        qmap: dict[str, Any] = {q.id: q for q in SURVEY_QUESTIONS}
+
+        def _value_label(qid: str, value: str) -> str:
+            q = qmap.get(qid)
+            if q is None:
+                return value
+            for v, lab in q.options:
+                if v == value:
+                    return lab
+            if getattr(q, "allow_none", False) and value == getattr(q, "none_value", None):
+                return getattr(q, "none_label", value)
+            return value
+
+        def _esc(s: str) -> str:
+            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        out: list[str] = [f"<b>Дамп ответов опросов</b> (последние {len(surveys)})", ""]
+        for i, s in enumerate(surveys, 1):
+            ts = s.get("ts", 0)
+            dt = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "?"
+            uid = s.get("uid", "?")
+            ver = s.get("survey_version", "?")
+            answers: dict = s.get("answers") or {}
+            skipped: list = s.get("skipped") or []
+            dur = s.get("duration_sec", 0)
+            out.append(
+                f"<b>#{i} — {dt} — uid {uid} — {ver}</b> "
+                f"(отв.{len(answers)} / проп.{len(skipped)} / {dur}с)"
+            )
+            # Идём по порядку вопросов — стабильный вывод.
+            for q in SURVEY_QUESTIONS:
+                qid = q.id
+                # Сам вопрос.
+                qhead = f"• <b>{qid}</b> {_esc(q.text)}"
+                if qid in answers:
+                    val = answers[qid]
+                    if isinstance(val, list):
+                        labels = [_value_label(qid, v) for v in val]
+                        rendered = ", ".join(labels) if labels else "—"
+                    else:
+                        rendered = _value_label(qid, str(val))
+                    out.append(qhead)
+                    out.append(f"  → {_esc(rendered)}")
+                elif qid in skipped:
+                    out.append(qhead)
+                    out.append("  → <i>пропущено</i>")
+                else:
+                    # На вопрос не отвечали и не пропускали (опрос оборван
+                    # раньше) — показываем как «не дошёл».
+                    out.append(qhead)
+                    out.append("  → <i>не дошёл</i>")
+                # Free follow-up (<qid>_free) — если есть в answers.
+                free_key = f"{qid}_free"
+                if free_key in answers:
+                    free_val = str(answers[free_key])
+                    out.append(f"  ↳ комментарий: {_esc(free_val)}")
+                elif free_key in skipped:
+                    out.append(f"  ↳ комментарий: <i>пропущено</i>")
+            out.append("")
+        return "\n".join(out)
 
 
 def _trim(text: str) -> str:

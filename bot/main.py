@@ -156,6 +156,41 @@ async def cmd_admin_stat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(ch, parse_mode="HTML")
 
 
+# ── /admin_surveys — полный дамп ответов опросов (только UID ADMIN_STAT_UID) ──
+# Поддерживает arg: /admin_surveys [N] — сколько последних опросов показать (по
+# умолчанию 20). Чанкуется на 3800 символов.
+async def cmd_admin_surveys(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    u = update.effective_user
+    if not u or u.id != ADMIN_STAT_UID:
+        return
+    limit = 20
+    if ctx.args:
+        try:
+            limit = max(1, min(200, int(ctx.args[0])))
+        except ValueError:
+            await update.message.reply_text("Аргумент должен быть числом (1..200).")
+            return
+    from bot.feedback import get_feedback_store
+    try:
+        text = get_feedback_store().format_surveys_dump(limit=limit)
+    except Exception as e:
+        logger.opt(exception=e).warning(f"admin_surveys: dump failed: {e!r}")
+        await update.message.reply_text(f"Ошибка: {type(e).__name__}: {e}")
+        return
+    chunks: list[str] = []
+    cur = ""
+    for line in text.splitlines(keepends=True):
+        if len(cur) + len(line) > 3800:
+            chunks.append(cur)
+            cur = line
+        else:
+            cur += line
+    if cur:
+        chunks.append(cur)
+    for ch in chunks:
+        await update.message.reply_text(ch, parse_mode="HTML")
+
+
 # ── error handler ──────────────────────────────────────────────────────────
 async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     err = ctx.error
@@ -440,6 +475,7 @@ def build_app() -> Application:
     # /admin_stat — приватный, доступен только UID ADMIN_STAT_UID. Внутри cmd_admin_stat
     # проверка по uid; для остальных команда «не существует» (silent return).
     app.add_handler(CommandHandler("admin_stat", cmd_admin_stat))
+    app.add_handler(CommandHandler("admin_surveys", cmd_admin_surveys))
     # Conversations
     for conv in build_conversations():
         app.add_handler(conv)
