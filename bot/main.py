@@ -27,8 +27,20 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 from loguru import logger
-from telegram import BotCommand, Update
-from telegram.ext import Application, CommandHandler, ContextTypes, TypeHandler
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    TypeHandler,
+)
 from telegram.request import HTTPXRequest
 
 from bot.auth import whitelist_only
@@ -199,6 +211,14 @@ async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None
         uid = update.effective_user.id
     log = logger.bind(uid=uid or 0, where="error_handler")
     log.opt(exception=err).error(f"unhandled: {type(err).__name__}: {err}")
+    # Если упало по причине протухшей Phygital-сессии — пингуем админа.
+    if err is not None:
+        name = type(err).__name__
+        if name in ("PhygitalAuthError", "RefreshError"):
+            try:
+                await _notify_admin_auth_required(ctx.application, f"{name}: {err}")
+            except Exception as e:
+                logger.opt(exception=e).warning(f"admin notify from error_handler: {e!r}")
 
 
 # ── глобальный TypeHandler: логируем каждое входящее обновление ────────────
@@ -286,6 +306,126 @@ def _make_request(pool_size: int, kwargs_template: dict | None) -> HTTPXRequest 
 
 PREFLIGHT_REFRESH_THRESHOLD_SEC = 15 * 60  # access JWT TTL ниже которого пробуем refresh
 
+# ── админ-нотификации про мёртвую сессию ──────────────────────────────────
+# Когда фоновый рефрешер или таск ловят PhygitalAuthError / 418, мы пингуем
+# ADMIN_STAT_UID в TG. Throttle, чтобы не заспамить.
+import subprocess as _subprocess
+import time as _time
+
+AUTH_NOTIFY_THROTTLE_SEC = 10 * 60  # одно сообщение раз в 10 мин
+_last_auth_notify_ts: float = 0.0
+# Хэндл живого процесса refresh_capture --show (Popen), чтобы не запускать второй параллельно.
+_active_auth_proc: _subprocess.Popen | None = None
+
+
+def _spawn_visible_recon() -> tuple[bool, str]:
+    """Запускает recon/refresh_capture в видимом режиме (-показывает Chromium).
+
+    Не блокирует — возвращает сразу. Если процесс уже жив, ничего не делает.
+    Возвращает (started, message).
+    """
+    global _active_auth_proc
+    if _active_auth_proc is not None and _active_auth_proc.poll() is None:
+        return False, f"окно логина уже открыто (pid={_active_auth_proc.pid})"
+    try:
+        # CREATE_NEW_CONSOLE на Windows, чтобы Chromium вылез отдельным окном
+        # и не блокировал stdout бота.
+        creationflags = 0
+        if sys.platform == "win32":
+            creationflags = _subprocess.CREATE_NEW_CONSOLE  # type: ignore[attr-defined]
+        _active_auth_proc = _subprocess.Popen(
+            [sys.executable, "-m", "recon.refresh_capture", "--show"],
+            cwd=str(ROOT),
+            creationflags=creationflags,
+        )
+        return True, f"процесс запущен (pid={_active_auth_proc.pid})"
+    except Exception as e:
+        return False, f"не удалось запустить: {type(e).__name__}: {e}"
+
+
+async def _notify_admin_auth_required(
+    app: Application,
+    reason: str,
+    *,
+    force: bool = False,
+) -> None:
+    """Шлёт админу TG-сообщение про мёртвую сессию + inline-кнопку «Открыть окно логина».
+
+    Throttle AUTH_NOTIFY_THROTTLE_SEC секунд между сообщениями (можно перебить force=True).
+    """
+    global _last_auth_notify_ts
+    now = _time.time()
+    if not force and (now - _last_auth_notify_ts) < AUTH_NOTIFY_THROTTLE_SEC:
+        return
+    _last_auth_notify_ts = now
+    try:
+        state = get_state()
+        ttl = state.session.jwt_ttl_seconds()
+        ttl_str = f"{ttl}s" if ttl is not None else "?"
+        captured = getattr(state.session, "captured_at", None)
+        captured_str = captured.isoformat(timespec="seconds") if captured else "?"
+    except Exception:
+        ttl_str, captured_str = "?", "?"
+    text = (
+        "⚠️ <b>Phygital-сессия отвалилась</b>\n\n"
+        f"Причина: <code>{reason[:300]}</code>\n"
+        f"Текущий access TTL: <code>{ttl_str}</code>\n"
+        f"captured_at: <code>{captured_str}</code>\n\n"
+        "Жми кнопку — открою окно логина на этой машине.\n"
+        "После логина (или если профиль ещё жив) окно закроется само, "
+        "бот подхватит свежие токены."
+    )
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Открыть окно логина", callback_data="admin:auth_open")]]
+    )
+    try:
+        await app.bot.send_message(
+            ADMIN_STAT_UID, text, parse_mode="HTML", reply_markup=kb,
+        )
+        logger.info(f"admin auth notify: отправлено uid={ADMIN_STAT_UID} reason={reason!r}")
+    except Exception as e:
+        logger.opt(exception=e).warning(f"admin auth notify: не доставлено: {e!r}")
+
+
+# Команда /admin_auth — открыть окно логина по запросу админа (без ожидания падения).
+async def cmd_admin_auth(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    u = update.effective_user
+    if not u or u.id != ADMIN_STAT_UID:
+        return
+    started, msg = _spawn_visible_recon()
+    head = "Открываю окно логина…" if started else "Окно НЕ открыто:"
+    await update.message.reply_text(
+        f"{head}\n<code>{msg}</code>\n\n"
+        "После успешного логина (или если профиль ещё жив) свежий дамп "
+        "подхватится автоматически — либо ближайшим тиком фонового рефрешера, "
+        "либо при следующей попытке refresh.",
+        parse_mode="HTML",
+    )
+
+
+# Callback под inline-кнопкой из админ-нотификации.
+async def cb_admin_auth_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q:
+        return
+    u = update.effective_user
+    if not u or u.id != ADMIN_STAT_UID:
+        await q.answer("Только для админа.", show_alert=False)
+        return
+    started, msg = _spawn_visible_recon()
+    await q.answer("Запускаю…" if started else "Не запустилось", show_alert=False)
+    try:
+        await q.edit_message_text(
+            ("✅ <b>Окно логина запущено</b>\n" if started
+             else "⚠️ <b>Не удалось запустить</b>\n")
+            + f"<code>{msg}</code>\n\n"
+            "Бот подхватит свежий дамп автоматически.",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass  # сообщение могло быть слишком старым — не критично
+
+
 # Фоновый рефрешер сессии: дёргает recon/refresh_capture (headless persistent profile),
 # чтобы Phygital не успел протухнуть refresh-токен между задачами. По умолчанию каждые 30 мин.
 # Отключается через BOT_AUTO_REFRESH_INTERVAL_MIN=0.
@@ -296,7 +436,7 @@ except ValueError:
     AUTO_REFRESH_INTERVAL_MIN = _DEFAULT_AUTO_REFRESH_MIN
 
 
-async def _auto_refresh_session_loop(state) -> None:
+async def _auto_refresh_session_loop(app: Application, state) -> None:
     """Фоном держит сессию Phygital живой.
 
     Каждые AUTO_REFRESH_INTERVAL_MIN минут:
@@ -305,6 +445,9 @@ async def _auto_refresh_session_loop(state) -> None:
       2) подсовывает этот дамп в текущую in-memory сессию через
          SessionManager._find_fresher_recon_dump + _swap_session_inplace;
       3) персистит обновлённую сессию на диск.
+
+    Если rc==2 (профиль user_data разлогинен) — шлём админу TG-сообщение
+    с кнопкой «Открыть окно логина». Throttle внутри _notify_admin_auth_required.
 
     Любые исключения внутри итерации логируются и проглатываются — луп никогда
     не падает. CancelledError пробрасывается чисто.
@@ -338,33 +481,62 @@ async def _auto_refresh_session_loop(state) -> None:
                     logger.warning("session auto-refresh: дамп сохранён, но fresher не найден (mtime / TTL фильтры)")
             elif rc == 2:
                 logger.warning("session auto-refresh: профиль user_data разлогинен — нужен ручной recon.capture")
+                await _notify_admin_auth_required(
+                    app,
+                    "headless recon: профиль user_data разлогинен (rc=2)",
+                )
             else:
                 logger.warning(f"session auto-refresh: recon вернул rc={rc}")
+                await _notify_admin_auth_required(app, f"headless recon вернул rc={rc}")
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.opt(exception=e).warning(f"session auto-refresh tick crashed: {e!r}")
+            await _notify_admin_auth_required(app, f"refresh tick crashed: {type(e).__name__}: {e}")
 
 
 # ── post-init: сетим меню команд и прогреваем state ────────────────────────
 async def _post_init(app: Application) -> None:
     # Прогреваем state (fail-fast, если сессия Phygital не загружается).
     state = get_state()
-    await _preflight_session(state)
-    await app.bot.set_my_commands(
-        [
-            BotCommand("menu", "Главное меню"),
-            BotCommand("start", "Главное меню"),
-            BotCommand("cancel", "Отменить текущий сценарий"),
-            BotCommand("help", "Справка"),
-        ]
-    )
+    try:
+        await _preflight_session(state)
+    except SystemExit as e:
+        # Перед тем как умереть — успеваем пингануть админа с кнопкой.
+        try:
+            await _notify_admin_auth_required(app, f"preflight failed: {e}", force=True)
+        except Exception as ee:
+            logger.opt(exception=ee).warning(f"admin notify on preflight fail: {ee!r}")
+        raise
+    public_cmds = [
+        BotCommand("menu", "Главное меню"),
+        BotCommand("start", "Главное меню"),
+        BotCommand("cancel", "Отменить текущий сценарий"),
+        BotCommand("help", "Справка"),
+    ]
+    await app.bot.set_my_commands(public_cmds)
+    # Для админа — расширенный список с админ-командами поверх публичных.
+    # scope=BotCommandScopeChat(chat_id=ADMIN_STAT_UID) пишет персональный набор
+    # команд только в его меню /-кнопок (для остальных юзеров не виден).
+    admin_cmds = public_cmds + [
+        BotCommand("admin_stat", "Админ: статистика по пользователям (7d / 24h / N)"),
+        BotCommand("admin_surveys", "Админ: дамп ответов опросов"),
+        BotCommand("admin_auth", "Админ: открыть окно логина Phygital"),
+    ]
+    try:
+        await app.bot.set_my_commands(
+            admin_cmds,
+            scope=BotCommandScopeChat(chat_id=ADMIN_STAT_UID),
+        )
+        logger.info(f"Admin commands set for uid={ADMIN_STAT_UID}")
+    except Exception as e:
+        logger.opt(exception=e).warning(f"set admin commands failed: {e!r}")
     logger.info("Bot commands registered")
     # Фоновый рефрешер Phygital-сессии. Не валит запуск, если плеяwright нет.
     if AUTO_REFRESH_INTERVAL_MIN > 0:
         try:
             app.bot_data["_session_refresher_task"] = asyncio.create_task(
-                _auto_refresh_session_loop(state),
+                _auto_refresh_session_loop(app, state),
                 name="session-refresher",
             )
         except Exception as e:
@@ -476,6 +648,8 @@ def build_app() -> Application:
     # проверка по uid; для остальных команда «не существует» (silent return).
     app.add_handler(CommandHandler("admin_stat", cmd_admin_stat))
     app.add_handler(CommandHandler("admin_surveys", cmd_admin_surveys))
+    app.add_handler(CommandHandler("admin_auth", cmd_admin_auth))
+    app.add_handler(CallbackQueryHandler(cb_admin_auth_open, pattern=r"^admin:auth_open$"))
     # Conversations
     for conv in build_conversations():
         app.add_handler(conv)
