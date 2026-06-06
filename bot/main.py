@@ -403,6 +403,45 @@ async def cmd_admin_auth(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+# /admin_relogin — попробовать headless-автологин по PHYGITAL_EMAIL/PHYGITAL_PASSWORD.
+# Не открывает окно. Если креды пусты или форма изменилась — расскажет.
+async def cmd_admin_relogin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    u = update.effective_user
+    if not u or u.id != ADMIN_STAT_UID:
+        return
+    await update.message.reply_text("Пробую headless-autologin (без видимого окна)…")
+    try:
+        from recon import autologin
+        rc = await autologin.main(headless=True)
+    except Exception as e:
+        await update.message.reply_text(f"autologin крашнулся: <code>{type(e).__name__}: {e}</code>", parse_mode="HTML")
+        return
+    if rc == 0:
+        state = get_state()
+        fresh = state.session_manager._find_fresher_recon_dump(state.session)
+        if fresh is not None:
+            state.session_manager._swap_session_inplace(state.session, fresh)
+            state.session_manager.save(state.session)
+            ttl = state.session.jwt_ttl_seconds()
+            await update.message.reply_text(
+                f"OK — autologin прошёл, сессия обновлена.\n"
+                f"Новый TTL: <code>{ttl}s</code> ({(ttl or 0) // 60} мин)",
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text(
+                "autologin вернул rc=0, но fresher dump не нашёлся — "
+                "посмотри логи."
+            )
+    elif rc == 2:
+        await update.message.reply_text(
+            "autologin не сработал (креды пусты / форма не нашлась / cookies не появились).\n"
+            "Жми /admin_auth и логинься руками в видимом окне."
+        )
+    else:
+        await update.message.reply_text(f"autologin: неожиданный rc={rc}. Посмотри логи.")
+
+
 # Callback под inline-кнопкой из админ-нотификации.
 async def cb_admin_auth_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
@@ -467,6 +506,17 @@ async def _auto_refresh_session_loop(app: Application, state) -> None:
         try:
             from recon import refresh_capture  # late import: playwright тянется лениво
             rc = await refresh_capture.main(headless=True)
+            if rc == 2:
+                # Профиль user_data разлогинен — пробуем headless-автологин по кредам.
+                logger.warning("session auto-refresh: профиль разлогинен — пробую autologin")
+                from recon import autologin
+                try:
+                    rc = await autologin.main(headless=True)
+                    if rc == 0:
+                        logger.success("session auto-refresh: autologin сработал")
+                except Exception as e:
+                    logger.opt(exception=e).warning(f"autologin крашнулся: {e!r}")
+                    rc = 2
             if rc == 0:
                 fresh = state.session_manager._find_fresher_recon_dump(state.session)
                 if fresh is not None:
@@ -480,10 +530,10 @@ async def _auto_refresh_session_loop(app: Application, state) -> None:
                 else:
                     logger.warning("session auto-refresh: дамп сохранён, но fresher не найден (mtime / TTL фильтры)")
             elif rc == 2:
-                logger.warning("session auto-refresh: профиль user_data разлогинен — нужен ручной recon.capture")
+                logger.warning("session auto-refresh: refresh+autologin не справились — нужен ручной логин")
                 await _notify_admin_auth_required(
                     app,
-                    "headless recon: профиль user_data разлогинен (rc=2)",
+                    "headless autologin не сработал (неверные креды? форма изменилась? token theft?)",
                 )
             else:
                 logger.warning(f"session auto-refresh: recon вернул rc={rc}")
@@ -521,7 +571,8 @@ async def _post_init(app: Application) -> None:
     admin_cmds = public_cmds + [
         BotCommand("admin_stat", "Админ: статистика по пользователям (7d / 24h / N)"),
         BotCommand("admin_surveys", "Админ: дамп ответов опросов"),
-        BotCommand("admin_auth", "Админ: открыть окно логина Phygital"),
+        BotCommand("admin_relogin", "Админ: headless-autologin Phygital"),
+        BotCommand("admin_auth", "Админ: открыть видимое окно логина Phygital"),
     ]
     try:
         await app.bot.set_my_commands(
@@ -649,6 +700,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("admin_stat", cmd_admin_stat))
     app.add_handler(CommandHandler("admin_surveys", cmd_admin_surveys))
     app.add_handler(CommandHandler("admin_auth", cmd_admin_auth))
+    app.add_handler(CommandHandler("admin_relogin", cmd_admin_relogin))
     app.add_handler(CallbackQueryHandler(cb_admin_auth_open, pattern=r"^admin:auth_open$"))
     # Conversations
     for conv in build_conversations():
