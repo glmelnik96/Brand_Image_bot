@@ -547,17 +547,47 @@ async def _auto_refresh_session_loop(app: Application, state) -> None:
 
 # ── post-init: сетим меню команд и прогреваем state ────────────────────────
 async def _post_init(app: Application) -> None:
-    # Прогреваем state (fail-fast, если сессия Phygital не загружается).
+    # Прогреваем state. Если preflight упал — НЕ убиваем процесс: пробуем
+    # headless-autologin, потом нотифицируем админа и продолжаем boot. Бот
+    # должен остаться живым, иначе callback кнопки «Открыть окно логина»
+    # некому обрабатывать, и фоновый рефрешер не подхватит свежий дамп.
     state = get_state()
     try:
         await _preflight_session(state)
     except SystemExit as e:
-        # Перед тем как умереть — успеваем пингануть админа с кнопкой.
+        logger.warning(f"preflight failed — пробую headless-autologin перед стартом: {e}")
+        recovered = False
         try:
-            await _notify_admin_auth_required(app, f"preflight failed: {e}", force=True)
+            from recon import autologin  # late import: playwright тянется лениво
+            rc = await autologin.main(headless=True)
+            if rc == 0:
+                fresh = state.session_manager._find_fresher_recon_dump(state.session)
+                if fresh is not None:
+                    state.session_manager._swap_session_inplace(state.session, fresh)
+                    state.session_manager.save(state.session)
+                    new_ttl = state.session.jwt_ttl_seconds()
+                    logger.success(
+                        f"preflight recovery: autologin ок, swap {fresh.name}, "
+                        f"новый TTL={new_ttl}s ({(new_ttl or 0) // 60}m)"
+                    )
+                    recovered = True
+                else:
+                    logger.warning("preflight recovery: autologin rc=0, но fresher dump не найден")
+            else:
+                logger.warning(f"preflight recovery: autologin rc={rc}")
         except Exception as ee:
-            logger.opt(exception=ee).warning(f"admin notify on preflight fail: {ee!r}")
-        raise
+            logger.opt(exception=ee).warning(f"preflight recovery: autologin крашнулся: {ee!r}")
+        if not recovered:
+            try:
+                await _notify_admin_auth_required(
+                    app, f"preflight failed: {e}", force=True,
+                )
+            except Exception as ee:
+                logger.opt(exception=ee).warning(f"admin notify on preflight fail: {ee!r}")
+            logger.warning(
+                "preflight recovery: не удалось — продолжаю boot без живой сессии. "
+                "Жмите кнопку «Открыть окно логина» в TG или /admin_auth."
+            )
     public_cmds = [
         BotCommand("menu", "Главное меню"),
         BotCommand("start", "Главное меню"),
@@ -690,12 +720,20 @@ def build_app() -> Application:
     builder = builder.post_init(_post_init)
     app = builder.build()
 
-    # Group=-1: лог всех апдейтов до того, как их разберут conversations.
-    app.add_handler(TypeHandler(Update, _log_every_update), group=-1)
+    # Group=-2: лог всех апдейтов до того, как их разберут conversations.
+    # В отдельной группе, чтобы НЕ конкурировать с b2b за один слот: в PTB v20
+    # в одной group выполняется только первый совпавший handler. TypeHandler матчит
+    # ВСЁ — и съедал бы slot у b2b в group=-1.
+    app.add_handler(TypeHandler(Update, _log_every_update), group=-2)
     # B2B-канал (@b2b ... от bot-отправителей из B2B_BOT_WHITELIST). Group=-1,
     # raise ApplicationHandlerStop в handler'е блокирует прохождение в menu/conv.
     from bot.b2b import build_b2b_handler
     app.add_handler(build_b2b_handler(), group=-1)
+    logger.info(
+        f"b2b: handler registered, whitelist={settings.b2b_whitelist or 'EMPTY (канал закрыт)'}, "
+        f"max_concurrency={settings.b2b_max_concurrency}, "
+        f"timeout={settings.b2b_request_timeout_sec}s"
+    )
     # /start, /help — регистрируем ДО conversation, чтобы они всегда срабатывали.
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
