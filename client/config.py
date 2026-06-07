@@ -23,6 +23,13 @@ class Settings(BaseSettings):
     bot_max_concurrency: int = 5
     # CSV uid'ов, которым доступна админская статистика по фидбэку.
     bot_owner_uids: str = ""
+    # CSV usernames (без @) ботов, которым разрешён b2b-канал (@b2b ... messages).
+    # Пустая строка = b2b-канал закрыт для всех.
+    b2b_bot_whitelist: str = ""
+    # Максимум параллельных b2b-задач (служебный канал, отдельный от user-семафора).
+    b2b_max_concurrency: int = 2
+    # Тайм-аут одной b2b-генерации, секунды (Resize_bot ждёт 600).
+    b2b_request_timeout_sec: int = 600
 
     session_file: Path = ROOT / "storage" / "session.json"
 
@@ -37,6 +44,14 @@ class Settings(BaseSettings):
     def owner_user_ids(self) -> set[int]:
         ids = (x.strip() for x in self.bot_owner_uids.split(","))
         return {int(x) for x in ids if x}
+
+    @property
+    def b2b_whitelist(self) -> set[str]:
+        return {
+            s.strip().lstrip("@").lower()
+            for s in self.b2b_bot_whitelist.split(",")
+            if s.strip()
+        }
 
 
 settings = Settings()

@@ -692,6 +692,10 @@ def build_app() -> Application:
 
     # Group=-1: лог всех апдейтов до того, как их разберут conversations.
     app.add_handler(TypeHandler(Update, _log_every_update), group=-1)
+    # B2B-канал (@b2b ... от bot-отправителей из B2B_BOT_WHITELIST). Group=-1,
+    # raise ApplicationHandlerStop в handler'е блокирует прохождение в menu/conv.
+    from bot.b2b import build_b2b_handler
+    app.add_handler(build_b2b_handler(), group=-1)
     # /start, /help — регистрируем ДО conversation, чтобы они всегда срабатывали.
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
