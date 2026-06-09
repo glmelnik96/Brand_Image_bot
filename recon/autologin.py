@@ -9,6 +9,15 @@ recon-дампа.
 
 Логи никогда не пишут password; email маскируется.
 
+Self-heal при сбое формы (на случай редизайна SuperTokens / anti-bot):
+    - При любом провале заполнения снимается дамп состояния в
+      recon/captures/autologin-fail-<ts>-<tag>/ (screenshot.png, dom.html,
+      meta.json со списком видимых input/button) — чтобы причина была видна.
+    - Перед поиском полей снимаются интерстициалы (cookie-overlay,
+      экран выбора провайдера «Continue with email»).
+    - Поля ищутся по лестнице селекторов, а не по одному.
+    - Если форму не нашли в headless — один авто-ретрай в видимом окне.
+
 Запуск (только если креды лежат в .env):
     python -m recon.autologin            # headless
     python -m recon.autologin --show     # с видимым окном (для отладки)
@@ -44,40 +53,141 @@ def _mask_email(email: str) -> str:
     return f"{head}***@{domain}"
 
 
+# Лестницы селекторов: от точного к широкому. SuperTokens может отрендерить
+# поля по-разному в зависимости от версии фронта, поэтому не полагаемся на один
+# селектор, а перебираем по очереди с коротким таймаутом на каждый.
+_EMAIL_SELECTORS = [
+    'input[name="email"]',
+    'input[type="email"]',
+    'input[autocomplete="username"]',
+    'input[placeholder*="mail" i]',
+    'input[aria-label*="mail" i]',
+    'input[type="text"]',  # широкий fallback — последним, чтобы не перехватить чужой инпут
+]
+_PASSWORD_SELECTORS = [
+    'input[name="password"]',
+    'input[type="password"]',
+    'input[autocomplete="current-password"]',
+    'input[placeholder*="pass" i]',
+    'input[aria-label*="pass" i]',
+]
+_SUBMIT_SELECTORS = [
+    'button[type="submit"]',
+    'button:has-text("Continue")',
+    'button:has-text("Sign in")',
+    'button:has-text("Войти")',
+    'button:has-text("Продолжить")',
+]
+
+
+async def _dump_failure(page, tag: str) -> Path:
+    """Ярус 1: при сбое снимаем состояние страницы на диск — скриншот, DOM и
+    список видимых input/button. Превращает «Timeout 15000ms» в полную картину
+    того, что реально было на экране в момент провала."""
+    d = CAPTURES / f"autologin-fail-{datetime.now():%Y%m%d-%H%M%S}-{tag}"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        await page.screenshot(path=str(d / "screenshot.png"), full_page=True)
+        (d / "dom.html").write_text(await page.content(), encoding="utf-8")
+        inputs = await page.eval_on_selector_all(
+            "input",
+            "els => els.map(e => ({name:e.name, type:e.type, "
+            "placeholder:e.placeholder, aria:e.getAttribute('aria-label'), "
+            "visible:!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length)}))",
+        )
+        buttons = await page.eval_on_selector_all(
+            "button",
+            "els => els.map(e => ({text:(e.innerText||'').trim().slice(0,40), "
+            "type:e.type, disabled:e.disabled, "
+            "visible:!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length)}))",
+        )
+        (d / "meta.json").write_text(
+            json.dumps(
+                {"url": page.url, "tag": tag, "inputs": inputs, "buttons": buttons},
+                ensure_ascii=False, indent=2,
+            ),
+            encoding="utf-8",
+        )
+        logger.warning(f"auto-login: состояние сбоя сохранено → {d}")
+    except Exception as e:
+        logger.warning(f"auto-login: не смог снять дамп сбоя ({tag}): {e}")
+    return d
+
+
+async def _clear_interstitials(page) -> None:
+    """Ярус 2: снимаем то, что предшествует/перекрывает форму — cookie-overlay и
+    экран выбора провайдера (SuperTokens мог добавить «Continue with email», и
+    тогда поле email появляется только после клика по нему)."""
+    # cookie-consent overlay перекрывает поле → state="visible" не выполнится
+    for sel in (
+        'button:has-text("Accept")',
+        'button:has-text("Принять")',
+        'button:has-text("Allow all")',
+        '[aria-label*="cookie" i] button',
+    ):
+        try:
+            b = page.locator(sel).first
+            if await b.count() and await b.is_visible():
+                await b.click(timeout=2000)
+                logger.info(f"auto-login: закрыл cookie-overlay ({sel!r})")
+                break
+        except Exception:
+            continue
+    # экран выбора провайдера: email-форма за кнопкой «Continue with email»
+    for sel in (
+        'button:has-text("Continue with email")',
+        'button:has-text("Sign in with email")',
+        'button:has-text("Войти по почте")',
+        'a:has-text("email")',
+    ):
+        try:
+            b = page.locator(sel).first
+            if await b.count() and await b.is_visible():
+                logger.info(f"auto-login: provider-chooser, жму {sel!r}")
+                await b.click(timeout=3000)
+                await asyncio.sleep(0.5)
+                break
+        except Exception:
+            continue
+
+
+async def _find_and_fill(page, selectors, value, field: str) -> bool:
+    """Ярус 3: перебираем лестницу селекторов с коротким таймаутом на каждый,
+    вместо одного длинного ожидания узкого селектора."""
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            await loc.wait_for(state="visible", timeout=3000)
+            await loc.fill(value)
+            logger.info(f"auto-login: поле {field} найдено селектором {sel!r}")
+            return True
+        except Exception:
+            continue
+    logger.warning(
+        f"auto-login: поле {field} не найдено ни по одному из "
+        f"{len(selectors)} селекторов"
+    )
+    return False
+
+
 async def _fill_login_form(page, email: str, password: str) -> bool:
-    """Заполняет email+password, жмёт Continue. Возвращает True, если submit нажат."""
-    # Email — SuperTokens рендерит как обычный input[type=email] или name=email.
-    try:
-        email_in = page.locator(
-            'input[name="email"], input[type="email"]'
-        ).first
-        await email_in.wait_for(state="visible", timeout=15000)
-        await email_in.fill(email)
-    except Exception as e:
-        logger.warning(f"auto-login: не нашёл/не заполнил поле email: {e}")
+    """Заполняет email+password, жмёт Continue. Возвращает True, если submit нажат.
+    При любом сбое снимает диагностический дамп (_dump_failure)."""
+    await _clear_interstitials(page)
+
+    if not await _find_and_fill(page, _EMAIL_SELECTORS, email, "email"):
+        await _dump_failure(page, "no-email")
         return False
-    # Password.
-    try:
-        pass_in = page.locator(
-            'input[name="password"], input[type="password"]'
-        ).first
-        await pass_in.wait_for(state="visible", timeout=5000)
-        await pass_in.fill(password)
-    except Exception as e:
-        logger.warning(f"auto-login: не нашёл/не заполнил поле password: {e}")
+    if not await _find_and_fill(page, _PASSWORD_SELECTORS, password, "password"):
+        await _dump_failure(page, "no-password")
         return False
+
     # Continue. SuperTokens обычно даёт button[type=submit] с текстом Continue / Sign In.
     # Дадим маленькую паузу — клиентская валидация (8 chars / 1 letter / 1 number)
     # должна успеть снять disabled с кнопки.
     await asyncio.sleep(0.3)
     submit = None
-    candidates = [
-        'button[type="submit"]',
-        'button:has-text("Continue")',
-        'button:has-text("Sign in")',
-        'button:has-text("Войти")',
-    ]
-    for sel in candidates:
+    for sel in _SUBMIT_SELECTORS:
         try:
             loc = page.locator(sel).first
             if await loc.count() > 0:
@@ -88,45 +198,34 @@ async def _fill_login_form(page, email: str, password: str) -> bool:
             continue
     if submit is None:
         logger.warning("auto-login: submit-кнопка не найдена ни по одному селектору")
+        await _dump_failure(page, "no-submit")
         return False
     try:
         await submit.click(timeout=5000)
     except Exception as e:
         logger.warning(f"auto-login: клик по submit упал: {e}")
+        await _dump_failure(page, "submit-click")
         return False
     return True
 
 
-async def main(headless: bool = True, settle_seconds: float = 10.0) -> int:
-    # Импортируем settings лениво — модуль может вызываться отдельно от бота.
+async def _attempt(
+    pw, headless: bool, email: str, password: str,
+    settle_seconds: float, storage_path: Path,
+) -> int:
+    """Одна попытка логина в своём persistent-контексте. Контекст всегда
+    закрывается в finally, чтобы можно было безопасно перезапустить попытку с
+    другим headless (ярус 4) на том же user_data-каталоге."""
+    logger.info(
+        f"auto-login: запускаю как {_mask_email(email)} (headless={headless})"
+    )
+    context = await pw.chromium.launch_persistent_context(
+        user_data_dir=str(USER_DATA),
+        headless=headless,
+        viewport={"width": 1280, "height": 800},
+        args=["--disable-blink-features=AutomationControlled"],
+    )
     try:
-        from client.config import settings
-    except Exception as e:
-        logger.error(f"auto-login: не смог загрузить settings: {e}")
-        return 2
-
-    email = (settings.phygital_email or "").strip()
-    password = (settings.phygital_password or "").strip()
-    if not email or not password:
-        logger.warning(
-            "auto-login: PHYGITAL_EMAIL / PHYGITAL_PASSWORD пусты в .env — "
-            "автологин пропущен. Заполни их и попробуй ещё раз."
-        )
-        return 2
-
-    CAPTURES.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    storage_path = CAPTURES / f"storage-{ts}.json"
-
-    logger.info(f"auto-login: запускаю как {_mask_email(email)} (headless={headless})")
-
-    async with async_playwright() as pw:
-        context = await pw.chromium.launch_persistent_context(
-            user_data_dir=str(USER_DATA),
-            headless=headless,
-            viewport={"width": 1280, "height": 800},
-            args=["--disable-blink-features=AutomationControlled"],
-        )
         page = context.pages[0] if context.pages else await context.new_page()
 
         # 1) Заходим на /sign-in напрямую — даже если профиль ещё авторизован,
@@ -135,7 +234,6 @@ async def main(headless: bool = True, settle_seconds: float = 10.0) -> int:
             await page.goto(SIGNIN_URL, wait_until="domcontentloaded", timeout=30000)
         except Exception as e:
             logger.error(f"auto-login: navigation to /sign-in failed: {e}")
-            await context.close()
             return 3
 
         # SPA может редиректнуть прямо на главную, если профиль ещё жив.
@@ -160,7 +258,6 @@ async def main(headless: bool = True, settle_seconds: float = 10.0) -> int:
 
             ok = await _fill_login_form(page, email, password)
             if not ok:
-                await context.close()
                 return 2
 
             # 3) Ждём, пока submit разрулится: либо SPA редиректнет на главную,
@@ -179,7 +276,7 @@ async def main(headless: bool = True, settle_seconds: float = 10.0) -> int:
                     f"Текущий URL: {page.url}. Возможно, неверные креды или Phygital "
                     "вернул ошибку — открой /sign-in вручную и проверь."
                 )
-                await context.close()
+                await _dump_failure(page, "no-token-after-submit")
                 return 2
 
         # 4) Дальше — стандартный recon-дамп, как в refresh_capture.
@@ -205,8 +302,44 @@ async def main(headless: bool = True, settle_seconds: float = 10.0) -> int:
             f"auto-login: access_token len={len(access['value'])} "
             f"refresh_token len={len(refresh['value']) if refresh else 0}"
         )
-        await context.close()
         return 0
+    finally:
+        await context.close()
+
+
+async def main(headless: bool = True, settle_seconds: float = 10.0) -> int:
+    # Импортируем settings лениво — модуль может вызываться отдельно от бота.
+    try:
+        from client.config import settings
+    except Exception as e:
+        logger.error(f"auto-login: не смог загрузить settings: {e}")
+        return 2
+
+    email = (settings.phygital_email or "").strip()
+    password = (settings.phygital_password or "").strip()
+    if not email or not password:
+        logger.warning(
+            "auto-login: PHYGITAL_EMAIL / PHYGITAL_PASSWORD пусты в .env — "
+            "автологин пропущен. Заполни их и попробуй ещё раз."
+        )
+        return 2
+
+    CAPTURES.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    storage_path = CAPTURES / f"storage-{ts}.json"
+
+    async with async_playwright() as pw:
+        rc = await _attempt(pw, headless, email, password, settle_seconds, storage_path)
+        # Ярус 4: форму не нашли в headless (rc=2) — один ретрай в видимом окне.
+        # Часть anti-automation/bot-challenge срабатывает только в headless,
+        # в headed-окне форма рендерится нормально. На rc=3 (навигация) и rc=0
+        # не эскалируем.
+        if rc == 2 and headless:
+            logger.warning(
+                "auto-login: headless-попытка не удалась — повторяю с видимым окном"
+            )
+            rc = await _attempt(pw, False, email, password, settle_seconds, storage_path)
+        return rc
 
 
 if __name__ == "__main__":
