@@ -30,6 +30,14 @@ class Settings(BaseSettings):
     b2b_max_concurrency: int = 2
     # Тайм-аут одной b2b-генерации, секунды (Resize_bot ждёт 600).
     b2b_request_timeout_sec: int = 600
+    # Remove Background по b2b: @b2b removebg (фото/документ+caption) и chained
+    # rmbg=1 у генерации. Фича-гейт: false = removebg-канал закрыт.
+    b2b_removebg_enabled: bool = False
+    # Отдельный семафор для removebg — нода Photoroom быстрая/дешёвая (~15s),
+    # не должна стоять в очереди за тяжёлой генерацией и наоборот.
+    b2b_removebg_max_concurrency: int = 4
+    # Тайм-аут одной removebg-операции, секунды.
+    b2b_removebg_timeout_sec: int = 120
 
     session_file: Path = ROOT / "storage" / "session.json"
 

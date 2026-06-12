@@ -732,7 +732,10 @@ def build_app() -> Application:
     logger.info(
         f"b2b: handler registered, whitelist={settings.b2b_whitelist or 'EMPTY (канал закрыт)'}, "
         f"max_concurrency={settings.b2b_max_concurrency}, "
-        f"timeout={settings.b2b_request_timeout_sec}s"
+        f"timeout={settings.b2b_request_timeout_sec}s; "
+        f"removebg={'ON' if settings.b2b_removebg_enabled else 'OFF'} "
+        f"(concurrency={settings.b2b_removebg_max_concurrency}, "
+        f"timeout={settings.b2b_removebg_timeout_sec}s)"
     )
     # /start, /help — регистрируем ДО conversation, чтобы они всегда срабатывали.
     app.add_handler(CommandHandler("start", cmd_start))
